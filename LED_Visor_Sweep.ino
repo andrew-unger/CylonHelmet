@@ -11,8 +11,8 @@
 #define LED_COUNT        32
 #define COLOR_ORDER      NEO_GRBW
 
-const char* ssid     = "YOUR_SSID";
-const char* password = "YOUR_PASSWORD";
+const char* ssid     = "SnoodleDoodleDoo";
+const char* password = "areyouawizardiot";
 
 #define I2S_BCK   5
 #define I2S_LRCK  6
@@ -20,13 +20,16 @@ const char* password = "YOUR_PASSWORD";
 /* ============================================== */
 
 // LED runtime values
-int minDelay         = 15;
-int maxDelay         = 135;
-int stripBrightness  = 180;
-int trailLength      = 7;
-float trailDecay     = 0.3;
-float eyeBoostFactor = 1.7;
-int edgePauseDelay   = 10;
+volatile int minDelay        = 15;
+volatile int maxDelay        = 135;
+volatile int stripBrightness = 180;
+int trailLength              = 7;
+float trailDecay             = 0.3;
+float eyeBoostFactor         = 1.7;
+int edgePauseDelay           = 10;
+
+portMUX_TYPE ledMux   = portMUX_INITIALIZER_UNLOCKED;
+static float decayLUT[16] = {};
 
 // Audio
 volatile int  audioVolume  = 2000;
@@ -235,10 +238,16 @@ const char index_html[] PROGMEM = R"rawliteral(
 
   <script>
     window.onload = function() {
-      document.getElementById('bval').innerText  = document.getElementById('brightness').value;
-      document.getElementById('mnval').innerText = document.getElementById('mindelay').value;
-      document.getElementById('mxval').innerText = document.getElementById('maxdelay').value;
-      document.getElementById('vval').innerText  = document.getElementById('volume').value;
+      fetch('/state').then(r => r.json()).then(s => {
+        document.getElementById('brightness').value = s.brightness;
+        document.getElementById('bval').innerText   = s.brightness;
+        document.getElementById('mindelay').value   = s.mindelay;
+        document.getElementById('mnval').innerText  = s.mindelay;
+        document.getElementById('maxdelay').value   = s.maxdelay;
+        document.getElementById('mxval').innerText  = s.maxdelay;
+        document.getElementById('volume').value     = s.volume;
+        document.getElementById('vval').innerText   = s.volume;
+      });
     }
 
     function sendSettings() {
@@ -420,6 +429,20 @@ const char index_html[] PROGMEM = R"rawliteral(
 </html>
 )rawliteral";
 
+/* ================= WAV HELPERS ================= */
+static uint32_t wavDataOffset(File &file) {
+  file.seek(12); // skip RIFF/WAVE header
+  while (file.available() >= 8) {
+    char id[4];
+    file.read((uint8_t*)id, 4);
+    uint32_t size = 0;
+    file.read((uint8_t*)&size, 4);
+    if (memcmp(id, "data", 4) == 0) return file.position();
+    file.seek(file.position() + size);
+  }
+  return 44; // fallback for malformed files
+}
+
 /* ================= WAV PLAYER ================= */
 void playWavFile(const char* filename) {
   File file = LittleFS.open(filename, "r");
@@ -427,7 +450,7 @@ void playWavFile(const char* filename) {
     Serial.printf("Failed to open %s\n", filename);
     return;
   }
-  file.seek(44);
+  file.seek(wavDataOffset(file));
   const int bufSize = 512;
   int16_t stereo[bufSize * 2];
   uint8_t raw[bufSize * 2];
@@ -476,23 +499,19 @@ void setupI2S() {
 }
 
 /* ================= HTTP HANDLERS ================= */
-static std::string buildPage() {
-  std::string html(index_html);
-  auto replace = [&](const std::string& from, const std::string& to) {
-    size_t pos = html.find(from);
-    if (pos != std::string::npos) html.replace(pos, from.size(), to);
-  };
-  replace("value=\"2000\" id=\"volume\"",    "value=\"" + std::to_string(audioVolume)     + "\" id=\"volume\"");
-  replace("value=\"180\" id=\"brightness\"", "value=\"" + std::to_string(stripBrightness) + "\" id=\"brightness\"");
-  replace("value=\"15\" id=\"mindelay\"",    "value=\"" + std::to_string(minDelay)        + "\" id=\"mindelay\"");
-  replace("value=\"135\" id=\"maxdelay\"",   "value=\"" + std::to_string(maxDelay)        + "\" id=\"maxdelay\"");
-  return html;
+static esp_err_t rootHandler(httpd_req_t *req) {
+  httpd_resp_set_type(req, "text/html");
+  httpd_resp_send(req, index_html, strlen(index_html));
+  return ESP_OK;
 }
 
-static esp_err_t rootHandler(httpd_req_t *req) {
-  std::string page = buildPage();
-  httpd_resp_set_type(req, "text/html");
-  httpd_resp_send(req, page.c_str(), page.size());
+static esp_err_t stateHandler(httpd_req_t *req) {
+  char json[100];
+  snprintf(json, sizeof(json),
+    "{\"brightness\":%d,\"mindelay\":%d,\"maxdelay\":%d,\"volume\":%d}",
+    (int)stripBrightness, (int)minDelay, (int)maxDelay, (int)audioVolume);
+  httpd_resp_set_type(req, "application/json");
+  httpd_resp_send(req, json, strlen(json));
   return ESP_OK;
 }
 
@@ -557,14 +576,17 @@ static esp_err_t wsAudioHandler(httpd_req_t *req) {
     if (ret == ESP_OK) {
       int samples = ws_pkt.len / 2;
       int16_t* src = (int16_t*)buf;
-      int16_t stereo[samples * 2];
-      for (int i = 0; i < samples; i++) {
-        int16_t scaled = (int16_t)((src[i] * audioVolume) / 32767);
-        stereo[i*2]   = scaled;
-        stereo[i*2+1] = scaled;
+      int16_t* stereo = (int16_t*)malloc(samples * 4);
+      if (stereo) {
+        for (int i = 0; i < samples; i++) {
+          int16_t scaled = (int16_t)((src[i] * audioVolume) / 32767);
+          stereo[i*2]   = scaled;
+          stereo[i*2+1] = scaled;
+        }
+        size_t bytesWritten;
+        i2s_write(I2S_NUM_0, stereo, samples * 4, &bytesWritten, portMAX_DELAY);
+        free(stereo);
       }
-      size_t bytesWritten;
-      i2s_write(I2S_NUM_0, stereo, samples * 4, &bytesWritten, portMAX_DELAY);
     }
     free(buf);
   }
@@ -604,12 +626,14 @@ void startHTTPS() {
   httpd_uri_t uriSet   = { "/set",   HTTP_GET, setHandler,     nullptr };
   httpd_uri_t uriSound = { "/sound", HTTP_GET, soundHandler,   nullptr };
   httpd_uri_t uriStop  = { "/stop",  HTTP_GET, stopHandler,    nullptr };
+  httpd_uri_t uriState = { "/state", HTTP_GET, stateHandler,   nullptr };
   httpd_uri_t uriWs    = { "/audio", HTTP_GET, wsAudioHandler, nullptr, true };
 
   httpd_register_uri_handler(httpsServer, &uriRoot);
   httpd_register_uri_handler(httpsServer, &uriSet);
   httpd_register_uri_handler(httpsServer, &uriSound);
   httpd_register_uri_handler(httpsServer, &uriStop);
+  httpd_register_uri_handler(httpsServer, &uriState);
   httpd_register_uri_handler(httpsServer, &uriWs);
 }
 
@@ -646,13 +670,13 @@ void audioTask(void *pvParameters) {
 void ledTask(void *pvParameters) {
   while (true) {
     for (int pos = 0; pos < LED_COUNT; pos++) {
-      drawCylonEye(pos, 255, trailLength, trailDecay, eyeBoostFactor, 1);
+      drawCylonEye(pos, 255, trailLength, eyeBoostFactor, 1);
       strip.show();
       vTaskDelay(pdMS_TO_TICKS(dynamicDelay(pos)));
     }
     vTaskDelay(pdMS_TO_TICKS(edgePauseDelay));
     for (int pos = LED_COUNT - 2; pos > 0; pos--) {
-      drawCylonEye(pos, 255, trailLength, trailDecay, eyeBoostFactor, -1);
+      drawCylonEye(pos, 255, trailLength, eyeBoostFactor, -1);
       strip.show();
       vTaskDelay(pdMS_TO_TICKS(dynamicDelay(pos)));
     }
@@ -668,6 +692,7 @@ void setup() {
   strip.setBrightness(stripBrightness);
   strip.clear();
   strip.show();
+  updateDecayLUT();
 
   if (!LittleFS.begin(true)) {
     Serial.println("LittleFS mount failed");
@@ -711,6 +736,16 @@ void loop() {
 }
 
 /* ================= FUNCTIONS ================= */
+void updateDecayLUT() {
+  float lut[16];
+  for (int t = 1; t < 16; t++)
+    lut[t] = powf(trailDecay, t);
+  portENTER_CRITICAL(&ledMux);
+  for (int t = 1; t < 16; t++)
+    decayLUT[t] = lut[t];
+  portEXIT_CRITICAL(&ledMux);
+}
+
 int dynamicDelay(int eyePos) {
   float midpoint = (LED_COUNT - 1) / 2.0;
   float distanceFromCenter = abs(eyePos - midpoint) / midpoint;
@@ -718,14 +753,13 @@ int dynamicDelay(int eyePos) {
   return (int)delayValue;
 }
 
-void drawCylonEye(int eyePos, uint8_t redValue, int trailLen, float decay,
-                  float boost, int direction) {
+void drawCylonEye(int eyePos, uint8_t redValue, int trailLen, float boost,
+                  int direction) {
   strip.clear();
   for (int t = 1; t <= trailLen; t++) {
     int ledIndex = eyePos - t * direction;
     if (ledIndex >= 0 && ledIndex < LED_COUNT) {
-      float factor = pow(decay, t);
-      uint8_t brightness = redValue * factor;
+      uint8_t brightness = (uint8_t)(redValue * decayLUT[t]);
       strip.setPixelColor(ledIndex, brightness, 0, 0, 0);
     }
   }
