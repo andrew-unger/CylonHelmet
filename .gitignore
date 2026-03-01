@@ -1,0 +1,6 @@
+# TLS certificates and private keys - generate your own
+data/cert.pem
+data/key.pem
+
+# Local tooling
+.claude/
