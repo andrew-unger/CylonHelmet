@@ -2,6 +2,7 @@
 #include <WiFi.h>
 #include <ESPmDNS.h>
 #include <LittleFS.h>
+#include <Preferences.h>
 #include <driver/i2s.h>
 #include <esp_https_server.h>
 #include <math.h>
@@ -42,6 +43,7 @@ static std::string certPem;
 static std::string keyPem;
 
 httpd_handle_t httpsServer = nullptr;
+Preferences prefs;
 
 Adafruit_NeoPixel strip(LED_COUNT, LED_PIN, COLOR_ORDER + NEO_KHZ800);
 
@@ -454,6 +456,7 @@ void playWavFile(const char* filename) {
   const int bufSize = 512;
   int16_t stereo[bufSize * 2];
   uint8_t raw[bufSize * 2];
+  int16_t lastSample = 0;
   stopAudio = false;
   while (file.available() && !stopAudio) {
     int bytesRead = file.read(raw, sizeof(raw));
@@ -465,13 +468,21 @@ void playWavFile(const char* filename) {
       stereo[i*2]   = scaled;
       stereo[i*2+1] = scaled;
     }
+    lastSample = stereo[(samples - 1) * 2];
     size_t bytesWritten;
     i2s_write(I2S_NUM_0, stereo, samples * 4, &bytesWritten, portMAX_DELAY);
   }
   file.close();
-  int16_t silence[64] = {0};
+  // Ramp to silence over ~6ms to avoid audible click on both normal end and early stop
+  const int fadeLen = 256;
+  int16_t fadeBuf[fadeLen * 2];
+  for (int i = 0; i < fadeLen; i++) {
+    int16_t s = (int16_t)((int32_t)lastSample * (fadeLen - 1 - i) / fadeLen);
+    fadeBuf[i*2]   = s;
+    fadeBuf[i*2+1] = s;
+  }
   size_t bytesWritten;
-  i2s_write(I2S_NUM_0, silence, sizeof(silence), &bytesWritten, portMAX_DELAY);
+  i2s_write(I2S_NUM_0, fadeBuf, sizeof(fadeBuf), &bytesWritten, portMAX_DELAY);
 }
 
 /* ================= I2S SETUP ================= */
@@ -529,6 +540,10 @@ static esp_err_t setHandler(httpd_req_t *req) {
       maxDelay = atoi(val);
     if (httpd_query_key_value(buf, "volume", val, sizeof(val)) == ESP_OK)
       audioVolume = atoi(val);
+    prefs.putInt("brightness", (int)stripBrightness);
+    prefs.putInt("mindelay",   (int)minDelay);
+    prefs.putInt("maxdelay",   (int)maxDelay);
+    prefs.putInt("volume",     (int)audioVolume);
   }
   httpd_resp_send(req, "OK", 2);
   return ESP_OK;
@@ -694,6 +709,13 @@ void setup() {
   strip.show();
   updateDecayLUT();
 
+  prefs.begin("cylon", false);
+  minDelay        = prefs.getInt("mindelay",   (int)minDelay);
+  maxDelay        = prefs.getInt("maxdelay",   (int)maxDelay);
+  stripBrightness = prefs.getInt("brightness", (int)stripBrightness);
+  audioVolume     = prefs.getInt("volume",     (int)audioVolume);
+  strip.setBrightness(stripBrightness);
+
   if (!LittleFS.begin(true)) {
     Serial.println("LittleFS mount failed");
     return;
@@ -760,10 +782,10 @@ void drawCylonEye(int eyePos, uint8_t redValue, int trailLen, float boost,
     int ledIndex = eyePos - t * direction;
     if (ledIndex >= 0 && ledIndex < LED_COUNT) {
       uint8_t brightness = (uint8_t)(redValue * decayLUT[t]);
-      strip.setPixelColor(ledIndex, brightness, 0, 0, 0);
+      strip.setPixelColor(ledIndex, brightness, 0, 0, brightness >> 2); // red + subtle warm glow
     }
   }
   int eyeBrightness = redValue * boost;
   if (eyeBrightness > 255) eyeBrightness = 255;
-  strip.setPixelColor(eyePos, eyeBrightness, 0, 0, 0);
+  strip.setPixelColor(eyePos, (uint8_t)eyeBrightness, 0, 0, (uint8_t)eyeBrightness); // hot white core
 }
