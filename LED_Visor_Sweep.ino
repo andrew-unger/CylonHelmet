@@ -37,6 +37,9 @@ float trailDecay             = 0.3;
 float eyeBoostFactor         = 1.7;
 int edgePauseDelay           = 10;
 volatile bool ledEnabled     = true;
+volatile bool scannerMode          = false;
+volatile bool scannerAutoMode      = true;   // AUTO on by default: radar flips between scanner/sweep
+volatile bool scannerAutoActivated = false;  // true = radar turned scanner on (allows auto-deactivation)
 
 portMUX_TYPE ledMux      = portMUX_INITIALIZER_UNLOCKED;
 portMUX_TYPE radarMux    = portMUX_INITIALIZER_UNLOCKED;
@@ -45,8 +48,10 @@ static float decayLUT[16] = {};
 // Audio
 volatile int  audioVolume  = 2000;
 volatile bool playTone     = false;
-volatile bool stopAudio    = false;
-String        pendingSound = "";
+volatile bool    stopAudio      = false;
+volatile bool    audioPlaying   = false;
+volatile uint8_t audioAmplitude = 0;
+String           pendingSound   = "";
 
 // Helmet mic streaming
 volatile bool micStreamActive = false;
@@ -67,7 +72,10 @@ volatile int  radarWsFd        = -1;
 volatile bool radarWsActive    = false;
 volatile bool targetPresent    = false;
 volatile unsigned long lastTargetSoundMs = 0;
-#define TARGET_SOUND_COOLDOWN_MS 5000
+volatile unsigned long lastCloseTargetMs = 0;
+volatile int scannerRangeMm        = 1500;   // auto-scanner activation distance in mm
+#define TARGET_SOUND_COOLDOWN_MS      5000
+#define SCANNER_DEACTIVATE_DELAY_MS   2000
 
 // Cert storage
 static std::string certPem;
@@ -190,6 +198,23 @@ const char index_html[] PROGMEM = R"rawliteral(
       border: 1px solid #ff3300;
     }
     .btn-led.off:hover { background: #330000; }
+    .auto-toggle {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      margin-top: 10px;
+      font-size: 1em;
+      letter-spacing: 2px;
+      cursor: pointer;
+      color: #ff6644;
+    }
+    .auto-toggle input[type=checkbox] {
+      width: 18px;
+      height: 18px;
+      accent-color: #00ffff;
+      cursor: pointer;
+    }
+    .auto-toggle.active { color: #00ffff; }
     hr { border-color: #ff3300; opacity: 0.3; margin: 30px 0; }
     .status { font-size: 0.9em; color: #ff6644; margin-top: 8px; }
     .status-green { font-size: 0.9em; color: #00ff88; margin-top: 8px; }
@@ -239,35 +264,48 @@ const char index_html[] PROGMEM = R"rawliteral(
 
   <div class="control">
     <label>Brightness</label>
-    <input type="range" min="10" max="255" value="180" id="brightness"
-      oninput="document.getElementById('bval').innerText=this.value">
-    <div class="value" id="bval"></div>
+    <input type="range" min="0" max="100" value="70" id="brightness"
+      oninput="document.getElementById('bval').innerText=this.value+'%'">
+    <div class="value" id="bval">70%</div>
   </div>
 
   <div class="control">
     <label>Min Delay (Center Speed)</label>
-    <input type="range" min="1" max="50" value="15" id="mindelay"
-      oninput="document.getElementById('mnval').innerText=this.value">
-    <div class="value" id="mnval"></div>
+    <input type="range" min="0" max="100" value="29" id="mindelay"
+      oninput="document.getElementById('mnval').innerText=this.value+'%'">
+    <div class="value" id="mnval">29%</div>
   </div>
 
   <div class="control">
     <label>Max Delay (Edge Speed)</label>
-    <input type="range" min="20" max="200" value="135" id="maxdelay"
-      oninput="document.getElementById('mxval').innerText=this.value">
-    <div class="value" id="mxval"></div>
+    <input type="range" min="0" max="100" value="64" id="maxdelay"
+      oninput="document.getElementById('mxval').innerText=this.value+'%'">
+    <div class="value" id="mxval">64%</div>
   </div>
 
   <div class="control">
     <label>Volume</label>
-    <input type="range" min="0" max="32767" value="2000" id="volume"
-      oninput="document.getElementById('vval').innerText=this.value">
-    <div class="value" id="vval"></div>
+    <input type="range" min="0" max="100" value="100" id="volume"
+      oninput="document.getElementById('vval').innerText=this.value+'%'">
+    <div class="value" id="vval">100%</div>
   </div>
 
   <button class="btn" onclick="sendSettings()">APPLY</button>
   <br>
+  <div class="status" id="modeStatus" style="margin-top:14px;font-size:1.1em;letter-spacing:3px;">MODE: VISOR SWEEP</div>
   <button class="btn-led" id="ledBtn" onclick="toggleLed()">&#9679; LED ON</button>
+  <br>
+  <button class="btn-led off" id="scannerBtn" onclick="toggleScanner()">&#9670; SCANNER OFF</button>
+  <br>
+  <label class="auto-toggle" id="autoLabel">
+    <input type="checkbox" id="autoChk" onchange="toggleAutoScanner()" checked> AUTO SCANNER
+  </label>
+  <div class="control" style="margin-top:10px;">
+    <label>Scanner Range</label>
+    <input type="range" min="500" max="6000" step="100" value="1500" id="scanRange"
+      oninput="document.getElementById('srval').innerText=(this.value/1000).toFixed(1)+'m'">
+    <div class="value" id="srval">1.5m</div>
+  </div>
 
   <hr>
 
@@ -343,8 +381,8 @@ const char index_html[] PROGMEM = R"rawliteral(
 
   <div class="mic-control">
     <label>Mic Gain</label>
-    <input type="range" min="1" max="8" value="4" id="micGain"
-      oninput="document.getElementById('mgval').innerText=gainLabel(this.value); setMicGain(this.value)">
+    <input type="range" min="1" max="8" value="5" id="micGain"
+      oninput="document.getElementById('mgval').innerText=gainLabel(this.value); setMicGain(9 - this.value)">
     <div class="value" id="mgval">16x</div>
   </div>
 
@@ -362,17 +400,27 @@ const char index_html[] PROGMEM = R"rawliteral(
   <script>
     window.onload = function() {
       fetch('/state').then(r => r.json()).then(s => {
-        document.getElementById('brightness').value = s.brightness;
-        document.getElementById('bval').innerText   = s.brightness;
-        document.getElementById('mindelay').value   = s.mindelay;
-        document.getElementById('mnval').innerText  = s.mindelay;
-        document.getElementById('maxdelay').value   = s.maxdelay;
-        document.getElementById('mxval').innerText  = s.maxdelay;
-        document.getElementById('volume').value     = s.volume;
-        document.getElementById('vval').innerText   = s.volume;
-        document.getElementById('micGain').value    = s.micgain;
-        document.getElementById('mgval').innerText  = gainLabel(s.micgain);
+        var bp = brightnessToPct(s.brightness);
+        document.getElementById('brightness').value = bp;
+        document.getElementById('bval').innerText   = bp+'%';
+        var mnp = minDelayToPct(s.mindelay);
+        document.getElementById('mindelay').value   = mnp;
+        document.getElementById('mnval').innerText  = mnp+'%';
+        var mxp = maxDelayToPct(s.maxdelay);
+        document.getElementById('maxdelay').value   = mxp;
+        document.getElementById('mxval').innerText  = mxp+'%';
+        var vp = volumeToPct(s.volume);
+        if (vp > 100) vp = 100;
+        document.getElementById('volume').value     = vp;
+        document.getElementById('vval').innerText   = vp+'%';
+        var micLevel = 9 - s.micgain;
+        document.getElementById('micGain').value    = micLevel;
+        document.getElementById('mgval').innerText  = gainLabel(micLevel);
+        document.getElementById('scanRange').value  = s.scanrange;
+        document.getElementById('srval').innerText = (s.scanrange/1000).toFixed(1)+'m';
         updateLedBtn(s.ledon === 1);
+        updateScannerBtn(s.scannermode === 1);
+        updateAutoChk(s.scannerauto === 1);
       });
       drawDradisIdle();
     }
@@ -394,8 +442,58 @@ const char index_html[] PROGMEM = R"rawliteral(
       });
     }
 
-    function gainLabel(shift) {
-      const gain = Math.round(Math.pow(2, 8 - parseInt(shift)));
+    function updateScannerBtn(scannerOn) {
+      const btn = document.getElementById('scannerBtn');
+      const mode = document.getElementById('modeStatus');
+      if (scannerOn) {
+        btn.classList.remove('off');
+        btn.innerHTML = '&#9670; SCANNER ON';
+        mode.innerText = 'MODE: SCANNER';
+        mode.style.color = '#00ffff';
+      } else {
+        btn.classList.add('off');
+        btn.innerHTML = '&#9670; SCANNER OFF';
+        mode.innerText = 'MODE: VISOR SWEEP';
+        mode.style.color = '#ff6644';
+      }
+    }
+
+    function updateAutoChk(on) {
+      const chk = document.getElementById('autoChk');
+      const lbl = document.getElementById('autoLabel');
+      chk.checked = on;
+      if (on) { lbl.classList.add('active'); }
+      else    { lbl.classList.remove('active'); }
+    }
+
+    function toggleScanner() {
+      fetch('/scannertoggle').then(r => r.text()).then(state => {
+        updateScannerBtn(state === 'ON');
+        updateAutoChk(false);  // manual toggle always unchecks AUTO
+      });
+    }
+
+    function toggleAutoScanner() {
+      fetch('/scannerauto').then(r => r.text()).then(state => {
+        updateAutoChk(state === 'ON');
+        // Refresh scanner state since unchecking auto may turn scanner off
+        fetch('/state').then(r2 => r2.json()).then(s => {
+          updateScannerBtn(s.scannermode === 1);
+        });
+      });
+    }
+
+    // Poll state every 2s to reflect auto-activation/deactivation
+    setInterval(function() {
+      fetch('/state').then(r => r.json()).then(s => {
+        updateLedBtn(s.ledon === 1);
+        updateScannerBtn(s.scannermode === 1);
+        updateAutoChk(s.scannerauto === 1);
+      }).catch(()=>{});
+    }, 2000);
+
+    function gainLabel(level) {
+      const gain = Math.round(Math.pow(2, parseInt(level) - 1));
       return gain + 'x';
     }
 
@@ -403,12 +501,24 @@ const char index_html[] PROGMEM = R"rawliteral(
       fetch(`/micgain?v=${val}`).then(r => r.text()).then(t => console.log(t));
     }
 
+    // Convert slider % to backend values
+    function pctToBrightness(p) { return Math.round(10 + p * 245 / 100); }
+    function pctToMinDelay(p)   { return Math.round(1 + p * 49 / 100); }
+    function pctToMaxDelay(p)   { return Math.round(20 + p * 180 / 100); }
+    function pctToVolume(p)     { return Math.round(p * 2000 / 100); }
+    // Convert backend values to slider %
+    function brightnessToPct(v) { return Math.round((v - 10) * 100 / 245); }
+    function minDelayToPct(v)   { return Math.round((v - 1) * 100 / 49); }
+    function maxDelayToPct(v)   { return Math.round((v - 20) * 100 / 180); }
+    function volumeToPct(v)     { return Math.round(v * 100 / 2000); }
+
     function sendSettings() {
-      const b  = document.getElementById('brightness').value;
-      const mn = document.getElementById('mindelay').value;
-      const mx = document.getElementById('maxdelay').value;
-      const v  = document.getElementById('volume').value;
-      fetch(`/set?brightness=${b}&mindelay=${mn}&maxdelay=${mx}&volume=${v}`)
+      const b  = pctToBrightness(document.getElementById('brightness').value);
+      const mn = pctToMinDelay(document.getElementById('mindelay').value);
+      const mx = pctToMaxDelay(document.getElementById('maxdelay').value);
+      const v  = pctToVolume(document.getElementById('volume').value);
+      const sr = document.getElementById('scanRange').value;
+      fetch(`/set?brightness=${b}&mindelay=${mn}&maxdelay=${mx}&volume=${v}&scanrange=${sr}`)
         .then(r => r.text()).then(t => console.log(t));
     }
 
@@ -519,7 +629,7 @@ const char index_html[] PROGMEM = R"rawliteral(
         finalBand.connect(processor);
         processor.connect(audioCtx.destination);
 
-        ws = new WebSocket('wss://cylon.local/audio');
+        ws = new WebSocket('wss://' + window.location.host + '/audio');
         ws.binaryType = 'arraybuffer';
 
         ws.onopen = () => {
@@ -581,7 +691,7 @@ const char index_html[] PROGMEM = R"rawliteral(
 
     async function startListen() {
       listenCtx = new AudioContext({ sampleRate: 16000 });
-      listenWs  = new WebSocket('wss://cylon.local/mic');
+      listenWs  = new WebSocket('wss://' + window.location.host + '/mic');
       listenWs.binaryType = 'arraybuffer';
 
       listenWs.onopen = () => {
@@ -804,7 +914,7 @@ const char index_html[] PROGMEM = R"rawliteral(
     }
 
     function startRadar() {
-      radarWs = new WebSocket('wss://cylon.local/radar');
+      radarWs = new WebSocket('wss://' + window.location.host + '/radar');
       radarWs.binaryType = 'arraybuffer';
 
       radarWs.onopen = () => {
@@ -839,7 +949,7 @@ const char index_html[] PROGMEM = R"rawliteral(
           const speed = data.getInt16(offset + 4, true); // cm/s
           lastTargets.push({ x, y, speed, valid: true });
           const dist  = Math.round(Math.sqrt(x*x + y*y));
-          const dir   = speed < 0 ? 'APPROACHING' : speed > 0 ? 'RECEDING' : 'STATIC';
+          const dir   = speed > 0 ? 'APPROACHING' : speed < 0 ? 'RECEDING' : 'STATIC';
           infoLines.push(`TGT ${i+1}: ${(dist/1000).toFixed(2)}m  ${Math.abs(speed)}cm/s  ${dir}`);
         }
         document.getElementById('dradisInfo').innerText =
@@ -888,16 +998,24 @@ void playWavFile(const char* filename) {
   uint8_t raw[bufSize * 2];
   int16_t lastSample = 0;
   stopAudio = false;
+  audioPlaying = true;
   while (file.available() && !stopAudio) {
     int bytesRead = file.read(raw, sizeof(raw));
     if (bytesRead <= 0) break;
     int samples = bytesRead / 2;
+    int16_t peak = 0;
     for (int i = 0; i < samples; i++) {
       int16_t sample = (int16_t)(raw[i*2] | (raw[i*2+1] << 8));
       int16_t scaled = (int16_t)((sample * audioVolume) / 32767);
       stereo[i*2]   = scaled;
       stereo[i*2+1] = scaled;
+      int16_t absVal = scaled < 0 ? -scaled : scaled;
+      if (absVal > peak) peak = absVal;
     }
+    // Export peak amplitude (0-255) for LED pulse effect
+    int amp = (peak * 255) / (audioVolume > 0 ? audioVolume : 1);
+    if (amp > 255) amp = 255;
+    audioAmplitude = (uint8_t)amp;
     lastSample = stereo[(samples - 1) * 2];
     size_t bytesWritten;
     i2s_write(I2S_NUM_0, stereo, samples * 4, &bytesWritten, portMAX_DELAY);
@@ -912,6 +1030,8 @@ void playWavFile(const char* filename) {
   }
   size_t bw;
   i2s_write(I2S_NUM_0, fadeBuf, sizeof(fadeBuf), &bw, portMAX_DELAY);
+  audioPlaying = false;
+  audioAmplitude = 0;
 }
 
 /* ================= I2S SETUP ================= */
@@ -984,10 +1104,11 @@ static esp_err_t rootHandler(httpd_req_t *req) {
 }
 
 static esp_err_t stateHandler(httpd_req_t *req) {
-  char json[160];
+  char json[256];
   snprintf(json, sizeof(json),
-    "{\"brightness\":%d,\"mindelay\":%d,\"maxdelay\":%d,\"volume\":%d,\"micgain\":%d,\"ledon\":%d}",
-    (int)stripBrightness, (int)minDelay, (int)maxDelay, (int)audioVolume, (int)micGainShift, ledEnabled ? 1 : 0);
+    "{\"brightness\":%d,\"mindelay\":%d,\"maxdelay\":%d,\"volume\":%d,\"micgain\":%d,\"ledon\":%d,\"scannermode\":%d,\"scannerauto\":%d,\"scanrange\":%d}",
+    (int)stripBrightness, (int)minDelay, (int)maxDelay, (int)audioVolume, (int)micGainShift,
+    ledEnabled ? 1 : 0, scannerMode ? 1 : 0, scannerAutoMode ? 1 : 0, (int)scannerRangeMm);
   httpd_resp_set_type(req, "application/json");
   httpd_resp_send(req, json, strlen(json));
   return ESP_OK;
@@ -1002,11 +1123,18 @@ static esp_err_t setHandler(httpd_req_t *req) {
     }
     if (httpd_query_key_value(buf, "mindelay", val, sizeof(val)) == ESP_OK) minDelay = atoi(val);
     if (httpd_query_key_value(buf, "maxdelay", val, sizeof(val)) == ESP_OK) maxDelay = atoi(val);
-    if (httpd_query_key_value(buf, "volume",   val, sizeof(val)) == ESP_OK) audioVolume = atoi(val);
+    if (httpd_query_key_value(buf, "volume",   val, sizeof(val)) == ESP_OK) {
+      int v = atoi(val); if (v > 2000) v = 2000; audioVolume = v;
+    }
+    if (httpd_query_key_value(buf, "scanrange", val, sizeof(val)) == ESP_OK) {
+      int r = atoi(val);
+      if (r >= 200 && r <= 6000) scannerRangeMm = r;
+    }
     prefs.putInt("brightness", (int)stripBrightness);
     prefs.putInt("mindelay",   (int)minDelay);
     prefs.putInt("maxdelay",   (int)maxDelay);
     prefs.putInt("volume",     (int)audioVolume);
+    prefs.putInt("scanrange",  (int)scannerRangeMm);
   }
   httpd_resp_send(req, "OK", 2);
   return ESP_OK;
@@ -1040,6 +1168,30 @@ static esp_err_t soundHandler(httpd_req_t *req) {
 static esp_err_t ledToggleHandler(httpd_req_t *req) {
   ledEnabled = !ledEnabled;
   const char* resp = ledEnabled ? "ON" : "OFF";
+  httpd_resp_send(req, resp, strlen(resp));
+  return ESP_OK;
+}
+
+static esp_err_t scannerToggleHandler(httpd_req_t *req) {
+  // Manual override — unchecks AUTO, locks scanner to whatever state
+  scannerMode = !scannerMode;
+  scannerAutoMode = false;
+  scannerAutoActivated = false;
+  const char* resp = scannerMode ? "ON" : "OFF";
+  httpd_resp_send(req, resp, strlen(resp));
+  return ESP_OK;
+}
+
+static esp_err_t scannerAutoHandler(httpd_req_t *req) {
+  scannerAutoMode = !scannerAutoMode;
+  if (!scannerAutoMode) {
+    // Unchecking AUTO — if radar had turned scanner on, turn it off
+    if (scannerAutoActivated) {
+      scannerMode = false;
+      scannerAutoActivated = false;
+    }
+  }
+  const char* resp = scannerAutoMode ? "ON" : "OFF";
   httpd_resp_send(req, resp, strlen(resp));
   return ESP_OK;
 }
@@ -1125,7 +1277,7 @@ void startHTTPS() {
   conf.servercert_len = certPem.size() + 1;
   conf.prvtkey_pem    = (const uint8_t*)keyPem.c_str();
   conf.prvtkey_len    = keyPem.size() + 1;
-  conf.httpd.max_uri_handlers = 16;
+  conf.httpd.max_uri_handlers = 18;
   conf.httpd.stack_size = 10240;
 
   if (httpd_ssl_start(&httpsServer, &conf) != ESP_OK) {
@@ -1142,7 +1294,9 @@ void startHTTPS() {
   httpd_uri_t uriWsAudio  = { "/audio",     HTTP_GET, wsAudioHandler,  nullptr, true };
   httpd_uri_t uriWsMic    = { "/mic",       HTTP_GET, wsMicHandler,    nullptr, true };
   httpd_uri_t uriWsRadar  = { "/radar",     HTTP_GET, wsRadarHandler,  nullptr, true };
-  httpd_uri_t uriLedToggle = { "/ledtoggle", HTTP_GET, ledToggleHandler, nullptr };
+  httpd_uri_t uriLedToggle     = { "/ledtoggle",     HTTP_GET, ledToggleHandler,     nullptr };
+  httpd_uri_t uriScannerToggle = { "/scannertoggle", HTTP_GET, scannerToggleHandler, nullptr };
+  httpd_uri_t uriScannerAuto   = { "/scannerauto",   HTTP_GET, scannerAutoHandler,   nullptr };
 
   httpd_register_uri_handler(httpsServer, &uriRoot);
   httpd_register_uri_handler(httpsServer, &uriSet);
@@ -1151,6 +1305,8 @@ void startHTTPS() {
   httpd_register_uri_handler(httpsServer, &uriState);
   httpd_register_uri_handler(httpsServer, &uriMicGain);
   httpd_register_uri_handler(httpsServer, &uriLedToggle);
+  httpd_register_uri_handler(httpsServer, &uriScannerToggle);
+  httpd_register_uri_handler(httpsServer, &uriScannerAuto);
   httpd_register_uri_handler(httpsServer, &uriWsAudio);
   httpd_register_uri_handler(httpsServer, &uriWsMic);
   httpd_register_uri_handler(httpsServer, &uriWsRadar);
@@ -1250,7 +1406,11 @@ void radarTask(void *pvParameters) {
             bool anyTarget = false;
             outBuf[0] = 0; // placeholder for count
 
+            // Only use the first valid target slot (slot 0 = strongest signal)
+            // LD2450 often reports ghost targets in slots 1-2
             for (int t = 0; t < 3; t++) {
+              if (count >= 1) break;  // limit to primary target only
+
               int base = 4 + t * 6;
               int16_t x     = (int16_t)(frameBuf[base]     | (frameBuf[base+1] << 8));
               int16_t y     = (int16_t)(frameBuf[base+2]   | (frameBuf[base+3] << 8));
@@ -1291,16 +1451,41 @@ void radarTask(void *pvParameters) {
             radarTargetCount = count;
             outBuf[0] = (uint8_t)count;
 
-            // Trigger "scan" sound if new targets detected (with cooldown)
+            // Check if target is within 1500mm (1.5m)
+            bool anyClose = false;
+            if (count > 0) {
+              int32_t dist = (int32_t)sqrtf((float)radarTargets[0].x * radarTargets[0].x +
+                                            (float)radarTargets[0].y * radarTargets[0].y);
+              if (dist <= scannerRangeMm) anyClose = true;
+            }
+
+            // Trigger "scan" sound when close target newly detected (always active)
             unsigned long now = millis();
-            if (anyTarget && !targetPresent) {
+            if (anyClose && !targetPresent) {
               if (now - lastTargetSoundMs > TARGET_SOUND_COOLDOWN_MS) {
                 stopAudio = true;
                 pendingSound = "scan";
                 lastTargetSoundMs = now;
               }
             }
-            targetPresent = anyTarget;
+
+            // AUTO mode: flip between scanner and sweep based on distance
+            if (scannerAutoMode) {
+              if (anyClose) {
+                lastCloseTargetMs = now;
+                if (!scannerMode) {
+                  scannerMode = true;
+                  scannerAutoActivated = true;
+                }
+              }
+              if (!anyClose && scannerMode && scannerAutoActivated) {
+                if (now - lastCloseTargetMs > SCANNER_DEACTIVATE_DELAY_MS) {
+                  scannerMode = false;
+                  scannerAutoActivated = false;
+                }
+              }
+            }
+            targetPresent = anyClose;
 
             // Send to DRADIS WebSocket client
             if (radarWsActive && radarWsFd >= 0) {
@@ -1324,23 +1509,75 @@ void radarTask(void *pvParameters) {
 
 /* ================= LED TASK ================= */
 void ledTask(void *pvParameters) {
+  static float smoothPos = LED_COUNT / 2.0f;  // smoothed eye position for scanner mode
+  bool wasScanner = false;
+
   while (true) {
     if (!ledEnabled) {
       strip.clear();
       strip.show();
       vTaskDelay(pdMS_TO_TICKS(100));
+      wasScanner = false;
+      smoothPos = LED_COUNT / 2.0f;
       continue;
     }
+
+    // Audio pulse: sample once per frame for consistency; range 80–255
+    uint8_t redVal = 255;
+    if (audioPlaying) {
+      uint8_t amp = audioAmplitude;  // snapshot volatile once
+      redVal = 80 + (uint8_t)((175 * amp) / 255);
+    }
+
+    if (scannerMode) {
+      // Read raw target X, map ±1500mm → LED 0–31
+      float targetPos = smoothPos;  // hold last position if no target
+      portENTER_CRITICAL(&radarMux);
+      if (radarTargetCount > 0 && radarTargets[0].valid) {
+        int x = radarTargets[0].x;
+        if (x < -1500) x = -1500;
+        if (x >  1500) x =  1500;
+        targetPos = (x + 1500.0f) / 3000.0f * (LED_COUNT - 1);
+      }
+      portEXIT_CRITICAL(&radarMux);
+
+      // Lerp smoothly toward target (25% per 30ms frame ≈ reaches target in ~10 frames)
+      smoothPos += (targetPos - smoothPos) * 0.25f;
+      if (smoothPos < 0.0f) smoothPos = 0.0f;
+      if (smoothPos > (float)(LED_COUNT - 1)) smoothPos = (float)(LED_COUNT - 1);
+      int eyePos = (int)(smoothPos + 0.5f);
+
+      drawCylonEyeScanner(eyePos, redVal, 2, eyeBoostFactor);
+      strip.show();
+      wasScanner = true;
+      vTaskDelay(pdMS_TO_TICKS(30));
+      continue;
+    }
+
+    // Transitioning back to sweep mode — clear any leftover scanner LEDs
+    if (wasScanner) {
+      strip.clear();
+      strip.show();
+      wasScanner = false;
+      smoothPos = LED_COUNT / 2.0f;
+      vTaskDelay(pdMS_TO_TICKS(50));
+    }
+
+    // Normal sweep mode — re-sample audio amplitude each step
     for (int pos = 0; pos < LED_COUNT; pos++) {
-      if (!ledEnabled) break;
-      drawCylonEye(pos, 255, trailLength, eyeBoostFactor, 1);
+      if (!ledEnabled || scannerMode) break;
+      uint8_t rv = 255;
+      if (audioPlaying) { uint8_t a = audioAmplitude; rv = 80 + (uint8_t)((175 * a) / 255); }
+      drawCylonEye(pos, rv, trailLength, eyeBoostFactor, 1);
       strip.show();
       vTaskDelay(pdMS_TO_TICKS(dynamicDelay(pos)));
     }
     vTaskDelay(pdMS_TO_TICKS(edgePauseDelay));
     for (int pos = LED_COUNT - 2; pos > 0; pos--) {
-      if (!ledEnabled) break;
-      drawCylonEye(pos, 255, trailLength, eyeBoostFactor, -1);
+      if (!ledEnabled || scannerMode) break;
+      uint8_t rv = 255;
+      if (audioPlaying) { uint8_t a = audioAmplitude; rv = 80 + (uint8_t)((175 * a) / 255); }
+      drawCylonEye(pos, rv, trailLength, eyeBoostFactor, -1);
       strip.show();
       vTaskDelay(pdMS_TO_TICKS(dynamicDelay(pos)));
     }
@@ -1364,6 +1601,7 @@ void setup() {
   stripBrightness = prefs.getInt("brightness", (int)stripBrightness);
   audioVolume     = prefs.getInt("volume",     (int)audioVolume);
   micGainShift    = prefs.getInt("micgain",    (int)micGainShift);
+  scannerRangeMm  = prefs.getInt("scanrange",  (int)scannerRangeMm);
   strip.setBrightness(stripBrightness);
 
   if (!LittleFS.begin(true)) { Serial.println("LittleFS mount failed"); return; }
@@ -1424,6 +1662,22 @@ void drawCylonEye(int eyePos, uint8_t redValue, int trailLen, float boost, int d
     }
   }
   int eb = redValue * boost;
+  if (eb > 255) eb = 255;
+  strip.setPixelColor(eyePos, (uint8_t)eb, 0, 0, 0);
+}
+
+// Scanner mode: 5-pixel symmetric eye — 5%, 25%, 100%, 25%, 5%
+void drawCylonEyeScanner(int eyePos, uint8_t redValue, int trailLen, float boost) {
+  strip.clear();
+  static const float scannerDecay[] = { 0.25f, 0.05f };  // ±1=25%, ±2=5%
+  for (int t = 1; t <= 2; t++) {
+    uint8_t br = (uint8_t)(redValue * scannerDecay[t - 1]);
+    int idxL = eyePos - t;
+    if (idxL >= 0) strip.setPixelColor(idxL, br, 0, 0, 0);
+    int idxR = eyePos + t;
+    if (idxR < LED_COUNT) strip.setPixelColor(idxR, br, 0, 0, 0);
+  }
+  int eb = (int)(redValue * boost);
   if (eb > 255) eb = 255;
   strip.setPixelColor(eyePos, (uint8_t)eb, 0, 0, 0);
 }
