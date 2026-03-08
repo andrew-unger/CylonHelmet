@@ -18,6 +18,14 @@ const char* password = "areyouawizardiot";
 #define I2S_BCK   5
 #define I2S_LRCK  6
 #define I2S_DOUT  7
+
+#define I2S_MIC_SD   15
+#define I2S_MIC_SCK  16
+#define I2S_MIC_WS   17
+
+#define RADAR_RX_PIN  9
+#define RADAR_TX_PIN  10
+#define RADAR_BAUD    256000
 /* ============================================== */
 
 // LED runtime values
@@ -28,8 +36,10 @@ int trailLength              = 7;
 float trailDecay             = 0.3;
 float eyeBoostFactor         = 1.7;
 int edgePauseDelay           = 10;
+volatile bool ledEnabled     = true;
 
-portMUX_TYPE ledMux   = portMUX_INITIALIZER_UNLOCKED;
+portMUX_TYPE ledMux      = portMUX_INITIALIZER_UNLOCKED;
+portMUX_TYPE radarMux    = portMUX_INITIALIZER_UNLOCKED;
 static float decayLUT[16] = {};
 
 // Audio
@@ -37,6 +47,27 @@ volatile int  audioVolume  = 2000;
 volatile bool playTone     = false;
 volatile bool stopAudio    = false;
 String        pendingSound = "";
+
+// Helmet mic streaming
+volatile bool micStreamActive = false;
+volatile int  micWsFd         = -1;
+volatile int  micGainShift    = 4;
+
+// Radar
+struct RadarTarget {
+  int16_t x;      // mm, negative=left, positive=right
+  int16_t y;      // mm, always positive (distance)
+  int16_t speed;  // cm/s, negative=approaching, positive=receding
+  bool    valid;
+};
+
+volatile RadarTarget radarTargets[3] = {};
+volatile int  radarTargetCount = 0;
+volatile int  radarWsFd        = -1;
+volatile bool radarWsActive    = false;
+volatile bool targetPresent    = false;
+volatile unsigned long lastTargetSoundMs = 0;
+#define TARGET_SOUND_COOLDOWN_MS 5000
 
 // Cert storage
 static std::string certPem;
@@ -116,9 +147,53 @@ const char index_html[] PROGMEM = R"rawliteral(
       letter-spacing: 2px;
     }
     .btn-mic.active { background: #ff3300; color: #111; }
+    .btn-listen {
+      background: #001a00;
+      color: #00ff88;
+      border: 2px solid #00ff88;
+      padding: 15px 40px;
+      font-size: 1.1em;
+      border-radius: 6px;
+      margin: 8px;
+      cursor: pointer;
+      letter-spacing: 2px;
+    }
+    .btn-listen.active { background: #00ff88; color: #111; }
+    .btn-radar {
+      background: #001a1a;
+      color: #00ffff;
+      border: 2px solid #00ffff;
+      padding: 15px 40px;
+      font-size: 1.1em;
+      border-radius: 6px;
+      margin: 8px;
+      cursor: pointer;
+      letter-spacing: 2px;
+    }
+    .btn-radar.active { background: #00ffff; color: #111; }
+    .btn-led {
+      background: #ff3300;
+      color: #111;
+      border: none;
+      padding: 12px 40px;
+      font-size: 1.2em;
+      border-radius: 6px;
+      margin-top: 15px;
+      cursor: pointer;
+      letter-spacing: 2px;
+      display: inline-block;
+    }
+    .btn-led:hover { background: #ff6644; }
+    .btn-led.off {
+      background: #1a0000;
+      color: #ff3300;
+      border: 1px solid #ff3300;
+    }
+    .btn-led.off:hover { background: #330000; }
     hr { border-color: #ff3300; opacity: 0.3; margin: 30px 0; }
     .status { font-size: 0.9em; color: #ff6644; margin-top: 8px; }
-    .fx-control { margin: 10px auto; max-width: 400px; }
+    .status-green { font-size: 0.9em; color: #00ff88; margin-top: 8px; }
+    .status-cyan  { font-size: 0.9em; color: #00ffff; margin-top: 8px; }
     .fx-grid {
       display: grid;
       grid-template-columns: 1fr 1fr;
@@ -134,6 +209,32 @@ const char index_html[] PROGMEM = R"rawliteral(
     }
     .fx-box label { font-size: 0.85em; margin-bottom: 4px; }
     .fx-box .value { font-size: 1em; margin-top: 2px; }
+    .mic-control {
+      margin: 10px auto;
+      max-width: 400px;
+      background: #001a00;
+      border: 1px solid #00ff88;
+      border-radius: 6px;
+      padding: 10px;
+    }
+    .mic-control label { color: #00ff88; font-size: 0.95em; margin-bottom: 4px; }
+    .mic-control input[type=range] { accent-color: #00ff88; }
+    .mic-control .value { color: #00ff88; font-size: 1em; margin-top: 2px; }
+    /* DRADIS */
+    #dradisCanvas {
+      display: block;
+      margin: 16px auto 0 auto;
+      border-radius: 50%;
+      border: 2px solid #00ffff;
+      box-shadow: 0 0 20px #00ffff44;
+    }
+    .dradis-info {
+      color: #00ffff;
+      font-size: 0.85em;
+      font-family: monospace;
+      margin-top: 8px;
+      min-height: 60px;
+    }
   </style>
 </head>
 <body>
@@ -168,6 +269,8 @@ const char index_html[] PROGMEM = R"rawliteral(
   </div>
 
   <button class="btn" onclick="sendSettings()">APPLY</button>
+  <br>
+  <button class="btn-led" id="ledBtn" onclick="toggleLed()">&#9679; LED ON</button>
 
   <hr>
 
@@ -235,8 +338,29 @@ const char index_html[] PROGMEM = R"rawliteral(
 
   <br>
   <button class="btn-mic" id="micBtn" onclick="toggleMic()">&#9671; ACTIVATE VOICE</button>
-  <div class="status" id="micStatus">Voice inactive
+  <div class="status" id="micStatus">Voice inactive</div>
+
+  <hr>
+
+  <h2>&#9651; HELMET MIC</h2>
+
+  <div class="mic-control">
+    <label>Mic Gain</label>
+    <input type="range" min="1" max="8" value="4" id="micGain"
+      oninput="document.getElementById('mgval').innerText=gainLabel(this.value); setMicGain(this.value)">
+    <div class="value" id="mgval">16x</div>
   </div>
+
+  <button class="btn-listen" id="listenBtn" onclick="toggleListen()">&#9671; LISTEN</button>
+  <div class="status-green" id="listenStatus">Helmet mic off</div>
+
+  <hr>
+
+  <h2>&#9651; DRADIS</h2>
+  <button class="btn-radar" id="radarBtn" onclick="toggleRadar()">&#9671; ACTIVATE DRADIS</button>
+  <div class="status-cyan" id="radarStatus">DRADIS offline</div>
+  <canvas id="dradisCanvas" width="320" height="320"></canvas>
+  <div class="dradis-info" id="dradisInfo">-- NO CONTACTS --</div>
 
   <script>
     window.onload = function() {
@@ -249,7 +373,37 @@ const char index_html[] PROGMEM = R"rawliteral(
         document.getElementById('mxval').innerText  = s.maxdelay;
         document.getElementById('volume').value     = s.volume;
         document.getElementById('vval').innerText   = s.volume;
+        document.getElementById('micGain').value    = s.micgain;
+        document.getElementById('mgval').innerText  = gainLabel(s.micgain);
+        updateLedBtn(s.ledon === 1);
       });
+      drawDradisIdle();
+    }
+
+    function updateLedBtn(on) {
+      const btn = document.getElementById('ledBtn');
+      if (on) {
+        btn.classList.remove('off');
+        btn.innerHTML = '&#9679; LED ON';
+      } else {
+        btn.classList.add('off');
+        btn.innerHTML = '&#9632; LED OFF';
+      }
+    }
+
+    function toggleLed() {
+      fetch('/ledtoggle').then(r => r.text()).then(state => {
+        updateLedBtn(state === 'ON');
+      });
+    }
+
+    function gainLabel(shift) {
+      const gain = Math.round(Math.pow(2, 8 - parseInt(shift)));
+      return gain + 'x';
+    }
+
+    function setMicGain(val) {
+      fetch(`/micgain?v=${val}`).then(r => r.text()).then(t => console.log(t));
     }
 
     function sendSettings() {
@@ -262,13 +416,11 @@ const char index_html[] PROGMEM = R"rawliteral(
     }
 
     function playSound(name) {
-      fetch(`/sound?name=${name}`)
-        .then(r => r.text()).then(t => console.log(t));
+      fetch(`/sound?name=${name}`).then(r => r.text()).then(t => console.log(t));
     }
 
     function stopSound() {
-      fetch('/stop')
-        .then(r => r.text()).then(t => console.log(t));
+      fetch('/stop').then(r => r.text()).then(t => console.log(t));
     }
 
     // ===== CYLON VOICE =====
@@ -313,38 +465,30 @@ const char index_html[] PROGMEM = R"rawliteral(
       try {
         document.getElementById('micStatus').innerText = 'Requesting mic...';
         micStream = await navigator.mediaDevices.getUserMedia({
-          audio: {
-            noiseSuppression: true,
-            echoCancellation: true,
-            autoGainControl: true
-          },
+          audio: { noiseSuppression: true, echoCancellation: true, autoGainControl: true },
           video: false
         });
 
         audioCtx = new AudioContext();
         const source = audioCtx.createMediaStreamSource(micStream);
 
-        // Highpass - remove low rumble
         highpass = audioCtx.createBiquadFilter();
         highpass.type = 'highpass';
         highpass.frequency.value = parseFloat(document.getElementById('hpFreq').value);
         highpass.Q.value = 0.5;
 
-        // Peak 1 - nasal midrange boost
         peak = audioCtx.createBiquadFilter();
         peak.type = 'peaking';
         peak.frequency.value = parseFloat(document.getElementById('peakFreq').value);
         peak.gain.value      = parseFloat(document.getElementById('peakGain').value);
         peak.Q.value = 2.5;
 
-        // Peak 2 - telephone/radio quality boost
         peak2 = audioCtx.createBiquadFilter();
         peak2.type = 'peaking';
         peak2.frequency.value = parseFloat(document.getElementById('peak2Freq').value);
         peak2.gain.value      = parseFloat(document.getElementById('peak2Gain').value);
         peak2.Q.value = 2.0;
 
-        // Ring modulator
         carrier = audioCtx.createOscillator();
         carrier.type = 'sawtooth';
         carrier.frequency.value = parseFloat(document.getElementById('ringFreq').value);
@@ -352,24 +496,20 @@ const char index_html[] PROGMEM = R"rawliteral(
         ringMod.gain.value = 1.0;
         carrier.connect(ringMod.gain);
 
-        // Distortion
         distortion = audioCtx.createWaveShaper();
         distortion.curve = makeDistortionCurve(parseFloat(document.getElementById('distAmount').value));
         distortion.oversample = '4x';
 
-        // Lowpass - cut harsh highs
         lowpass = audioCtx.createBiquadFilter();
         lowpass.type = 'lowpass';
         lowpass.frequency.value = parseFloat(document.getElementById('lpFreq').value);
         lowpass.Q.value = 1.0;
 
-        // Final bandpass - tighten the sound
         const finalBand = audioCtx.createBiquadFilter();
         finalBand.type = 'bandpass';
         finalBand.frequency.value = 2500;
         finalBand.Q.value = 1.5;
 
-        // Chain: source → highpass → peak → peak2 → ringMod → distortion → lowpass → finalBand → output
         source.connect(highpass);
         highpass.connect(peak);
         peak.connect(peak2);
@@ -401,14 +541,20 @@ const char index_html[] PROGMEM = R"rawliteral(
         processor.onaudioprocess = (e) => {
           if (ws && ws.readyState === WebSocket.OPEN) {
             const float32 = e.inputBuffer.getChannelData(0);
-            const int16 = new Int16Array(float32.length);
+            const ulaw = new Uint8Array(float32.length);
             for (let i = 0; i < float32.length; i++) {
-              int16[i] = Math.max(-32768, Math.min(32767, float32[i] * 32767));
+              let s = Math.round(Math.max(-1, Math.min(1, float32[i])) * 32767);
+              let sign = 0;
+              if (s < 0) { sign = 0x80; s = -s; }
+              if (s > 32635) s = 32635;
+              s += 132;
+              let exp = 7;
+              for (let m = 0x4000; (s & m) === 0 && exp > 0; exp--, m >>= 1);
+              ulaw[i] = (~(sign | (exp << 4) | ((s >> (exp + 3)) & 0x0F))) & 0xFF;
             }
-            ws.send(int16.buffer);
+            ws.send(ulaw.buffer);
           }
         };
-
       } catch(e) {
         document.getElementById('micStatus').innerText = 'Error: ' + e.message;
       }
@@ -426,6 +572,297 @@ const char index_html[] PROGMEM = R"rawliteral(
       document.getElementById('micBtn').innerHTML = '&#9671; ACTIVATE VOICE';
       document.getElementById('micStatus').innerText = 'Voice inactive';
     }
+
+    // ===== HELMET MIC LISTEN =====
+    let listenActive = false;
+    let listenWs     = null;
+    let listenCtx    = null;
+
+    async function toggleListen() {
+      if (!listenActive) { await startListen(); } else { stopListen(); }
+    }
+
+    async function startListen() {
+      listenCtx = new AudioContext({ sampleRate: 16000 });
+      listenWs  = new WebSocket('wss://cylon.local/mic');
+      listenWs.binaryType = 'arraybuffer';
+
+      listenWs.onopen = () => {
+        document.getElementById('listenStatus').innerText = 'Listening...';
+        document.getElementById('listenBtn').classList.add('active');
+        document.getElementById('listenBtn').innerHTML = '&#9679; STOP LISTENING';
+        listenActive = true;
+      };
+
+      listenWs.onerror = () => {
+        document.getElementById('listenStatus').innerText = 'Connection error';
+        stopListen();
+      };
+
+      listenWs.onmessage = (event) => {
+        const ulaw    = new Uint8Array(event.data);
+        const float32 = new Float32Array(ulaw.length);
+        for (let i = 0; i < ulaw.length; i++) {
+          let u    = ~ulaw[i];
+          let sign = u & 0x80;
+          let exp  = (u >> 4) & 0x07;
+          let mant = u & 0x0F;
+          let s    = (((mant << 3) + 0x84) << exp) - 0x84;
+          float32[i] = (sign ? -s : s) / 32768.0;
+        }
+        const buffer = listenCtx.createBuffer(1, float32.length, 16000);
+        buffer.copyToChannel(float32, 0);
+        const src = listenCtx.createBufferSource();
+        src.buffer = buffer;
+        src.connect(listenCtx.destination);
+        src.start();
+      };
+    }
+
+    function stopListen() {
+      if (listenWs)  { listenWs.close(); listenWs = null; }
+      if (listenCtx) { listenCtx.close(); listenCtx = null; }
+      listenActive = false;
+      document.getElementById('listenBtn').classList.remove('active');
+      document.getElementById('listenBtn').innerHTML = '&#9671; LISTEN';
+      document.getElementById('listenStatus').innerText = 'Helmet mic off';
+    }
+
+    // ===== DRADIS =====
+    const DRADIS_RANGE_MM = 6000;
+    const canvas   = document.getElementById('dradisCanvas');
+    const ctx      = canvas.getContext('2d');
+    const CX       = canvas.width  / 2;
+    const CY       = canvas.height / 2;
+    const RADIUS   = CX - 10;
+
+    let radarActive    = false;
+    let radarWs        = null;
+    let sweepAngle     = 0;
+    let sweepAnimId    = null;
+    let lastTargets    = [];
+    // Fading blips: array of {x, y, age}
+    let blipTrails     = [];
+
+    function drawDradisIdle() {
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      ctx.fillStyle = '#000d0d';
+      ctx.beginPath();
+      ctx.arc(CX, CY, RADIUS, 0, Math.PI * 2);
+      ctx.fill();
+
+      // Rings
+      ctx.strokeStyle = '#004433';
+      ctx.lineWidth = 1;
+      for (let r = 1; r <= 4; r++) {
+        ctx.beginPath();
+        ctx.arc(CX, CY, RADIUS * r / 4, 0, Math.PI * 2);
+        ctx.stroke();
+      }
+
+      // Crosshairs
+      ctx.beginPath();
+      ctx.moveTo(CX, CY - RADIUS);
+      ctx.lineTo(CX, CY + RADIUS);
+      ctx.moveTo(CX - RADIUS, CY);
+      ctx.lineTo(CX + RADIUS, CY);
+      ctx.stroke();
+
+      // Range labels
+      ctx.fillStyle = '#006644';
+      ctx.font = '10px monospace';
+      ctx.textAlign = 'center';
+      for (let r = 1; r <= 4; r++) {
+        const dist = Math.round(DRADIS_RANGE_MM * r / 4 / 1000 * 10) / 10;
+        ctx.fillText(dist + 'm', CX + 4, CY - RADIUS * r / 4 - 3);
+      }
+
+      ctx.fillStyle = '#004433';
+      ctx.font = '11px monospace';
+      ctx.fillText('DRADIS OFFLINE', CX, CY + 5);
+    }
+
+    function drawDradisFrame() {
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+      // Background
+      ctx.fillStyle = '#000d0d';
+      ctx.beginPath();
+      ctx.arc(CX, CY, RADIUS, 0, Math.PI * 2);
+      ctx.fill();
+
+      // Clip to circle
+      ctx.save();
+      ctx.beginPath();
+      ctx.arc(CX, CY, RADIUS, 0, Math.PI * 2);
+      ctx.clip();
+
+      // Sweep gradient trail
+      const sweepTrailLength = Math.PI * 0.6;
+      for (let i = 0; i < 60; i++) {
+        const a = sweepAngle - (sweepTrailLength * i / 60);
+        const alpha = (1 - i / 60) * 0.18;
+        ctx.beginPath();
+        ctx.moveTo(CX, CY);
+        ctx.arc(CX, CY, RADIUS, a, a + sweepTrailLength / 60);
+        ctx.fillStyle = `rgba(0,255,180,${alpha})`;
+        ctx.fill();
+      }
+
+      // Sweep line
+      ctx.strokeStyle = 'rgba(0,255,180,0.9)';
+      ctx.lineWidth = 1.5;
+      ctx.beginPath();
+      ctx.moveTo(CX, CY);
+      ctx.lineTo(
+        CX + Math.cos(sweepAngle) * RADIUS,
+        CY + Math.sin(sweepAngle) * RADIUS
+      );
+      ctx.stroke();
+
+      // Fading blip trails
+      blipTrails = blipTrails.filter(b => b.age < 60);
+      for (const b of blipTrails) {
+        const alpha = 1 - b.age / 60;
+        ctx.beginPath();
+        ctx.arc(b.cx, b.cy, 5, 0, Math.PI * 2);
+        ctx.fillStyle = `rgba(0,255,150,${alpha * 0.4})`;
+        ctx.fill();
+        b.age++;
+      }
+
+      // Live target blips
+      for (const t of lastTargets) {
+        if (!t.valid) continue;
+        // Convert radar coords to canvas:
+        // X: left/right maps to canvas X (positive = right)
+        // Y: distance maps upward from center (sensor at bottom center)
+        const px = CX + (t.x / DRADIS_RANGE_MM) * RADIUS;
+        const py = CY - (t.y / DRADIS_RANGE_MM) * RADIUS;
+
+        // Outer glow
+        const grd = ctx.createRadialGradient(px, py, 0, px, py, 12);
+        grd.addColorStop(0, 'rgba(0,255,150,0.9)');
+        grd.addColorStop(1, 'rgba(0,255,150,0)');
+        ctx.beginPath();
+        ctx.arc(px, py, 12, 0, Math.PI * 2);
+        ctx.fillStyle = grd;
+        ctx.fill();
+
+        // Core dot
+        ctx.beginPath();
+        ctx.arc(px, py, 4, 0, Math.PI * 2);
+        ctx.fillStyle = '#00ffaa';
+        ctx.fill();
+
+        // Add to trail
+        blipTrails.push({ cx: px, cy: py, age: 0 });
+      }
+
+      ctx.restore();
+
+      // Rings (drawn outside clip so they stay crisp)
+      ctx.strokeStyle = '#004433';
+      ctx.lineWidth = 1;
+      for (let r = 1; r <= 4; r++) {
+        ctx.beginPath();
+        ctx.arc(CX, CY, RADIUS * r / 4, 0, Math.PI * 2);
+        ctx.stroke();
+      }
+
+      // Crosshairs
+      ctx.strokeStyle = '#003322';
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.moveTo(CX, CY - RADIUS);
+      ctx.lineTo(CX, CY + RADIUS);
+      ctx.moveTo(CX - RADIUS, CY);
+      ctx.lineTo(CX + RADIUS, CY);
+      ctx.stroke();
+
+      // Range labels
+      ctx.fillStyle = '#006644';
+      ctx.font = '10px monospace';
+      ctx.textAlign = 'center';
+      for (let r = 1; r <= 4; r++) {
+        const dist = Math.round(DRADIS_RANGE_MM * r / 4 / 1000 * 10) / 10;
+        ctx.fillText(dist + 'm', CX + 4, CY - RADIUS * r / 4 - 3);
+      }
+
+      // Border
+      ctx.strokeStyle = '#00ffff44';
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.arc(CX, CY, RADIUS, 0, Math.PI * 2);
+      ctx.stroke();
+
+      // Advance sweep
+      sweepAngle += 0.03;
+      if (sweepAngle > Math.PI * 2) sweepAngle -= Math.PI * 2;
+
+      sweepAnimId = requestAnimationFrame(drawDradisFrame);
+    }
+
+    function toggleRadar() {
+      if (!radarActive) { startRadar(); } else { stopRadar(); }
+    }
+
+    function startRadar() {
+      radarWs = new WebSocket('wss://cylon.local/radar');
+      radarWs.binaryType = 'arraybuffer';
+
+      radarWs.onopen = () => {
+        document.getElementById('radarStatus').innerText = 'DRADIS active - scanning...';
+        document.getElementById('radarBtn').classList.add('active');
+        document.getElementById('radarBtn').innerHTML = '&#9679; DEACTIVATE DRADIS';
+        radarActive = true;
+        sweepAngle = 0;
+        blipTrails = [];
+        sweepAnimId = requestAnimationFrame(drawDradisFrame);
+      };
+
+      radarWs.onerror = () => {
+        document.getElementById('radarStatus').innerText = 'Connection error';
+        stopRadar();
+      };
+
+      radarWs.onclose = () => {
+        stopRadar();
+      };
+
+      radarWs.onmessage = (event) => {
+        // Binary frame: 1 byte count, then up to 3 x 6 bytes (x,y,speed each int16 LE)
+        const data = new DataView(event.data);
+        const count = data.getUint8(0);
+        lastTargets = [];
+        let infoLines = [];
+        for (let i = 0; i < count; i++) {
+          const offset = 1 + i * 6;
+          const x     = data.getInt16(offset,     true); // mm
+          const y     = data.getInt16(offset + 2, true); // mm
+          const speed = data.getInt16(offset + 4, true); // cm/s
+          lastTargets.push({ x, y, speed, valid: true });
+          const dist  = Math.round(Math.sqrt(x*x + y*y));
+          const dir   = speed < 0 ? 'APPROACHING' : speed > 0 ? 'RECEDING' : 'STATIC';
+          infoLines.push(`TGT ${i+1}: ${(dist/1000).toFixed(2)}m  ${Math.abs(speed)}cm/s  ${dir}`);
+        }
+        document.getElementById('dradisInfo').innerText =
+          count > 0 ? infoLines.join('\n') : '-- NO CONTACTS --';
+      };
+    }
+
+    function stopRadar() {
+      if (radarWs)     { radarWs.close(); radarWs = null; }
+      if (sweepAnimId) { cancelAnimationFrame(sweepAnimId); sweepAnimId = null; }
+      radarActive = false;
+      lastTargets = [];
+      blipTrails  = [];
+      document.getElementById('radarBtn').classList.remove('active');
+      document.getElementById('radarBtn').innerHTML = '&#9671; ACTIVATE DRADIS';
+      document.getElementById('radarStatus').innerText = 'DRADIS offline';
+      document.getElementById('dradisInfo').innerText = '-- NO CONTACTS --';
+      drawDradisIdle();
+    }
   </script>
 </body>
 </html>
@@ -433,7 +870,7 @@ const char index_html[] PROGMEM = R"rawliteral(
 
 /* ================= WAV HELPERS ================= */
 static uint32_t wavDataOffset(File &file) {
-  file.seek(12); // skip RIFF/WAVE header
+  file.seek(12);
   while (file.available() >= 8) {
     char id[4];
     file.read((uint8_t*)id, 4);
@@ -442,16 +879,13 @@ static uint32_t wavDataOffset(File &file) {
     if (memcmp(id, "data", 4) == 0) return file.position();
     file.seek(file.position() + size);
   }
-  return 44; // fallback for malformed files
+  return 44;
 }
 
 /* ================= WAV PLAYER ================= */
 void playWavFile(const char* filename) {
   File file = LittleFS.open(filename, "r");
-  if (!file) {
-    Serial.printf("Failed to open %s\n", filename);
-    return;
-  }
+  if (!file) { Serial.printf("Failed to open %s\n", filename); return; }
   file.seek(wavDataOffset(file));
   const int bufSize = 512;
   int16_t stereo[bufSize * 2];
@@ -473,7 +907,6 @@ void playWavFile(const char* filename) {
     i2s_write(I2S_NUM_0, stereo, samples * 4, &bytesWritten, portMAX_DELAY);
   }
   file.close();
-  // Ramp to silence over ~6ms to avoid audible click on both normal end and early stop
   const int fadeLen = 256;
   int16_t fadeBuf[fadeLen * 2];
   for (int i = 0; i < fadeLen; i++) {
@@ -481,13 +914,13 @@ void playWavFile(const char* filename) {
     fadeBuf[i*2]   = s;
     fadeBuf[i*2+1] = s;
   }
-  size_t bytesWritten;
-  i2s_write(I2S_NUM_0, fadeBuf, sizeof(fadeBuf), &bytesWritten, portMAX_DELAY);
+  size_t bw;
+  i2s_write(I2S_NUM_0, fadeBuf, sizeof(fadeBuf), &bw, portMAX_DELAY);
 }
 
 /* ================= I2S SETUP ================= */
 void setupI2S() {
-  i2s_config_t i2s_config = {
+  i2s_config_t dac_config = {
     .mode                 = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX),
     .sample_rate          = 44100,
     .bits_per_sample      = I2S_BITS_PER_SAMPLE_16BIT,
@@ -499,14 +932,52 @@ void setupI2S() {
     .use_apll             = false,
     .tx_desc_auto_clear   = true
   };
-  i2s_pin_config_t pin_config = {
+  i2s_pin_config_t dac_pins = {
     .bck_io_num   = I2S_BCK,
     .ws_io_num    = I2S_LRCK,
     .data_out_num = I2S_DOUT,
     .data_in_num  = I2S_PIN_NO_CHANGE
   };
-  i2s_driver_install(I2S_NUM_0, &i2s_config, 0, NULL);
-  i2s_set_pin(I2S_NUM_0, &pin_config);
+  i2s_driver_install(I2S_NUM_0, &dac_config, 0, NULL);
+  i2s_set_pin(I2S_NUM_0, &dac_pins);
+
+  i2s_config_t mic_config = {
+    .mode                 = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX),
+    .sample_rate          = 16000,
+    .bits_per_sample      = I2S_BITS_PER_SAMPLE_32BIT,
+    .channel_format       = I2S_CHANNEL_FMT_ONLY_LEFT,
+    .communication_format = I2S_COMM_FORMAT_STAND_I2S,
+    .intr_alloc_flags     = ESP_INTR_FLAG_LEVEL1,
+    .dma_buf_count        = 16,
+    .dma_buf_len          = 128,
+    .use_apll             = false
+  };
+  i2s_pin_config_t mic_pins = {
+    .bck_io_num   = I2S_MIC_SCK,
+    .ws_io_num    = I2S_MIC_WS,
+    .data_out_num = I2S_PIN_NO_CHANGE,
+    .data_in_num  = I2S_MIC_SD
+  };
+  i2s_driver_install(I2S_NUM_1, &mic_config, 0, NULL);
+  i2s_set_pin(I2S_NUM_1, &mic_pins);
+}
+
+/* ================= μLAW ================= */
+static inline uint8_t linearToUlaw(int16_t sample) {
+  int sign = 0, s = sample;
+  if (s < 0) { sign = 0x80; s = -s; }
+  if (s > 32635) s = 32635;
+  s += 132;
+  int exp = 7;
+  for (int m = 0x4000; (s & m) == 0 && exp > 0; exp--, m >>= 1);
+  return (~(sign | (exp << 4) | ((s >> (exp + 3)) & 0x0F))) & 0xFF;
+}
+
+static inline int16_t ulawToLinear(uint8_t ulaw) {
+  ulaw = ~ulaw;
+  int sign = ulaw & 0x80, exp = (ulaw >> 4) & 0x07, mant = ulaw & 0x0F;
+  int s = (((mant << 3) + 0x84) << exp) - 0x84;
+  return (int16_t)(sign ? -s : s);
 }
 
 /* ================= HTTP HANDLERS ================= */
@@ -517,10 +988,10 @@ static esp_err_t rootHandler(httpd_req_t *req) {
 }
 
 static esp_err_t stateHandler(httpd_req_t *req) {
-  char json[100];
+  char json[160];
   snprintf(json, sizeof(json),
-    "{\"brightness\":%d,\"mindelay\":%d,\"maxdelay\":%d,\"volume\":%d}",
-    (int)stripBrightness, (int)minDelay, (int)maxDelay, (int)audioVolume);
+    "{\"brightness\":%d,\"mindelay\":%d,\"maxdelay\":%d,\"volume\":%d,\"micgain\":%d,\"ledon\":%d}",
+    (int)stripBrightness, (int)minDelay, (int)maxDelay, (int)audioVolume, (int)micGainShift, ledEnabled ? 1 : 0);
   httpd_resp_set_type(req, "application/json");
   httpd_resp_send(req, json, strlen(json));
   return ESP_OK;
@@ -531,19 +1002,28 @@ static esp_err_t setHandler(httpd_req_t *req) {
   if (httpd_req_get_url_query_str(req, buf, sizeof(buf)) == ESP_OK) {
     char val[32];
     if (httpd_query_key_value(buf, "brightness", val, sizeof(val)) == ESP_OK) {
-      stripBrightness = atoi(val);
-      strip.setBrightness(stripBrightness);
+      stripBrightness = atoi(val); strip.setBrightness(stripBrightness);
     }
-    if (httpd_query_key_value(buf, "mindelay", val, sizeof(val)) == ESP_OK)
-      minDelay = atoi(val);
-    if (httpd_query_key_value(buf, "maxdelay", val, sizeof(val)) == ESP_OK)
-      maxDelay = atoi(val);
-    if (httpd_query_key_value(buf, "volume", val, sizeof(val)) == ESP_OK)
-      audioVolume = atoi(val);
+    if (httpd_query_key_value(buf, "mindelay", val, sizeof(val)) == ESP_OK) minDelay = atoi(val);
+    if (httpd_query_key_value(buf, "maxdelay", val, sizeof(val)) == ESP_OK) maxDelay = atoi(val);
+    if (httpd_query_key_value(buf, "volume",   val, sizeof(val)) == ESP_OK) audioVolume = atoi(val);
     prefs.putInt("brightness", (int)stripBrightness);
     prefs.putInt("mindelay",   (int)minDelay);
     prefs.putInt("maxdelay",   (int)maxDelay);
     prefs.putInt("volume",     (int)audioVolume);
+  }
+  httpd_resp_send(req, "OK", 2);
+  return ESP_OK;
+}
+
+static esp_err_t micGainHandler(httpd_req_t *req) {
+  char buf[64];
+  if (httpd_req_get_url_query_str(req, buf, sizeof(buf)) == ESP_OK) {
+    char val[16];
+    if (httpd_query_key_value(buf, "v", val, sizeof(val)) == ESP_OK) {
+      int g = atoi(val);
+      if (g >= 1 && g <= 8) { micGainShift = g; prefs.putInt("micgain", g); }
+    }
   }
   httpd_resp_send(req, "OK", 2);
   return ESP_OK;
@@ -554,52 +1034,50 @@ static esp_err_t soundHandler(httpd_req_t *req) {
   if (httpd_req_get_url_query_str(req, buf, sizeof(buf)) == ESP_OK) {
     char name[32];
     if (httpd_query_key_value(buf, "name", name, sizeof(name)) == ESP_OK) {
-      stopAudio = true;
-      pendingSound = String(name);
+      stopAudio = true; pendingSound = String(name);
     }
   }
   httpd_resp_send(req, "OK", 2);
   return ESP_OK;
 }
 
+static esp_err_t ledToggleHandler(httpd_req_t *req) {
+  ledEnabled = !ledEnabled;
+  const char* resp = ledEnabled ? "ON" : "OFF";
+  httpd_resp_send(req, resp, strlen(resp));
+  return ESP_OK;
+}
+
 static esp_err_t stopHandler(httpd_req_t *req) {
-  stopAudio    = true;
-  pendingSound = "";
-  playTone     = false;
+  stopAudio = true; pendingSound = ""; playTone = false;
   httpd_resp_send(req, "OK", 2);
   return ESP_OK;
 }
 
 static esp_err_t wsAudioHandler(httpd_req_t *req) {
-  if (req->method == HTTP_GET) {
-    Serial.println("WebSocket handshake");
-    return ESP_OK;
-  }
+  if (req->method == HTTP_GET) { Serial.println("Voice WS connected"); return ESP_OK; }
   httpd_ws_frame_t ws_pkt;
   uint8_t *buf = nullptr;
-  memset(&ws_pkt, 0, sizeof(httpd_ws_frame_t));
+  memset(&ws_pkt, 0, sizeof(ws_pkt));
   ws_pkt.type = HTTPD_WS_TYPE_BINARY;
-
   esp_err_t ret = httpd_ws_recv_frame(req, &ws_pkt, 0);
   if (ret != ESP_OK) return ret;
-
   if (ws_pkt.len) {
     buf = (uint8_t*)malloc(ws_pkt.len);
     if (!buf) return ESP_ERR_NO_MEM;
     ws_pkt.payload = buf;
     ret = httpd_ws_recv_frame(req, &ws_pkt, ws_pkt.len);
     if (ret == ESP_OK) {
-      int samples = ws_pkt.len / 2;
-      int16_t* src = (int16_t*)buf;
+      int samples = ws_pkt.len;
       int16_t* stereo = (int16_t*)malloc(samples * 4);
       if (stereo) {
         for (int i = 0; i < samples; i++) {
-          int16_t scaled = (int16_t)((src[i] * audioVolume) / 32767);
-          stereo[i*2]   = scaled;
-          stereo[i*2+1] = scaled;
+          int16_t s = ulawToLinear(buf[i]);
+          int16_t scaled = (int16_t)((s * audioVolume) / 32767);
+          stereo[i*2] = stereo[i*2+1] = scaled;
         }
-        size_t bytesWritten;
-        i2s_write(I2S_NUM_0, stereo, samples * 4, &bytesWritten, portMAX_DELAY);
+        size_t bw;
+        i2s_write(I2S_NUM_0, stereo, samples * 4, &bw, portMAX_DELAY);
         free(stereo);
       }
     }
@@ -608,18 +1086,42 @@ static esp_err_t wsAudioHandler(httpd_req_t *req) {
   return ret;
 }
 
+static esp_err_t wsMicHandler(httpd_req_t *req) {
+  if (req->method == HTTP_GET) {
+    micWsFd = httpd_req_to_sockfd(req);
+    micStreamActive = true;
+    Serial.println("Helmet mic WS connected");
+    return ESP_OK;
+  }
+  httpd_ws_frame_t ws_pkt;
+  memset(&ws_pkt, 0, sizeof(ws_pkt));
+  ws_pkt.type = HTTPD_WS_TYPE_BINARY;
+  httpd_ws_recv_frame(req, &ws_pkt, 0);
+  return ESP_OK;
+}
+
+static esp_err_t wsRadarHandler(httpd_req_t *req) {
+  if (req->method == HTTP_GET) {
+    radarWsFd = httpd_req_to_sockfd(req);
+    radarWsActive = true;
+    Serial.println("DRADIS WS connected");
+    return ESP_OK;
+  }
+  httpd_ws_frame_t ws_pkt;
+  memset(&ws_pkt, 0, sizeof(ws_pkt));
+  ws_pkt.type = HTTPD_WS_TYPE_BINARY;
+  httpd_ws_recv_frame(req, &ws_pkt, 0);
+  return ESP_OK;
+}
+
 /* ================= HTTPS SERVER ================= */
 void startHTTPS() {
   File certFile = LittleFS.open("/cert.pem", "r");
   File keyFile  = LittleFS.open("/key.pem", "r");
-  if (!certFile || !keyFile) {
-    Serial.println("Failed to open cert files!");
-    return;
-  }
+  if (!certFile || !keyFile) { Serial.println("Failed to open cert files!"); return; }
   certPem = std::string(certFile.readString().c_str());
   keyPem  = std::string(keyFile.readString().c_str());
-  certFile.close();
-  keyFile.close();
+  certFile.close(); keyFile.close();
   Serial.println("Certs loaded");
 
   httpd_ssl_config_t conf = HTTPD_SSL_CONFIG_DEFAULT();
@@ -627,70 +1129,221 @@ void startHTTPS() {
   conf.servercert_len = certPem.size() + 1;
   conf.prvtkey_pem    = (const uint8_t*)keyPem.c_str();
   conf.prvtkey_len    = keyPem.size() + 1;
-  conf.httpd.max_uri_handlers = 10;
+  conf.httpd.max_uri_handlers = 16;
   conf.httpd.stack_size = 10240;
 
-  esp_err_t ret = httpd_ssl_start(&httpsServer, &conf);
-  if (ret != ESP_OK) {
-    Serial.printf("HTTPS start failed: %d\n", ret);
-    return;
+  if (httpd_ssl_start(&httpsServer, &conf) != ESP_OK) {
+    Serial.println("HTTPS start failed"); return;
   }
   Serial.println("HTTPS server started");
 
-  httpd_uri_t uriRoot  = { "/",      HTTP_GET, rootHandler,    nullptr };
-  httpd_uri_t uriSet   = { "/set",   HTTP_GET, setHandler,     nullptr };
-  httpd_uri_t uriSound = { "/sound", HTTP_GET, soundHandler,   nullptr };
-  httpd_uri_t uriStop  = { "/stop",  HTTP_GET, stopHandler,    nullptr };
-  httpd_uri_t uriState = { "/state", HTTP_GET, stateHandler,   nullptr };
-  httpd_uri_t uriWs    = { "/audio", HTTP_GET, wsAudioHandler, nullptr, true };
+  httpd_uri_t uriRoot    = { "/",        HTTP_GET, rootHandler,    nullptr };
+  httpd_uri_t uriSet     = { "/set",     HTTP_GET, setHandler,     nullptr };
+  httpd_uri_t uriSound   = { "/sound",   HTTP_GET, soundHandler,   nullptr };
+  httpd_uri_t uriStop    = { "/stop",    HTTP_GET, stopHandler,    nullptr };
+  httpd_uri_t uriState   = { "/state",   HTTP_GET, stateHandler,   nullptr };
+  httpd_uri_t uriMicGain = { "/micgain", HTTP_GET, micGainHandler, nullptr };
+  httpd_uri_t uriWsAudio  = { "/audio",     HTTP_GET, wsAudioHandler,  nullptr, true };
+  httpd_uri_t uriWsMic    = { "/mic",       HTTP_GET, wsMicHandler,    nullptr, true };
+  httpd_uri_t uriWsRadar  = { "/radar",     HTTP_GET, wsRadarHandler,  nullptr, true };
+  httpd_uri_t uriLedToggle = { "/ledtoggle", HTTP_GET, ledToggleHandler, nullptr };
 
   httpd_register_uri_handler(httpsServer, &uriRoot);
   httpd_register_uri_handler(httpsServer, &uriSet);
   httpd_register_uri_handler(httpsServer, &uriSound);
   httpd_register_uri_handler(httpsServer, &uriStop);
   httpd_register_uri_handler(httpsServer, &uriState);
-  httpd_register_uri_handler(httpsServer, &uriWs);
+  httpd_register_uri_handler(httpsServer, &uriMicGain);
+  httpd_register_uri_handler(httpsServer, &uriLedToggle);
+  httpd_register_uri_handler(httpsServer, &uriWsAudio);
+  httpd_register_uri_handler(httpsServer, &uriWsMic);
+  httpd_register_uri_handler(httpsServer, &uriWsRadar);
 }
 
-/* ================= AUDIO TASK (Core 1) ================= */
+/* ================= AUDIO TASK ================= */
 void audioTask(void *pvParameters) {
   while (true) {
     if (pendingSound != "") {
-      String sound = pendingSound;
-      pendingSound = "";
-      String path = "/" + sound + ".wav";
-      playWavFile(path.c_str());
+      String sound = pendingSound; pendingSound = "";
+      playWavFile(("/" + sound + ".wav").c_str());
     } else if (playTone) {
       static float phase = 0;
-      float phaseIncrement = 2.0f * M_PI * 440.0f / 44100.0f;
-      int16_t buffer[64];
+      float inc = 2.0f * M_PI * 440.0f / 44100.0f;
+      int16_t buf[64];
       for (int i = 0; i < 64; i++) {
-        int16_t sample = (int16_t)(sinf(phase) * audioVolume);
-        buffer[i] = sample;
-        phase += phaseIncrement;
+        buf[i] = (int16_t)(sinf(phase) * audioVolume);
+        phase += inc;
         if (phase > 2.0f * M_PI) phase -= 2.0f * M_PI;
       }
-      size_t bytesWritten;
-      i2s_write(I2S_NUM_0, buffer, sizeof(buffer), &bytesWritten, portMAX_DELAY);
+      size_t bw;
+      i2s_write(I2S_NUM_0, buf, sizeof(buf), &bw, portMAX_DELAY);
     } else {
       int16_t silence[64] = {0};
-      size_t bytesWritten;
-      i2s_write(I2S_NUM_0, silence, sizeof(silence), &bytesWritten, portMAX_DELAY);
+      size_t bw;
+      i2s_write(I2S_NUM_0, silence, sizeof(silence), &bw, portMAX_DELAY);
       vTaskDelay(1);
     }
   }
 }
 
-/* ================= LED TASK (Core 0) ================= */
+/* ================= MIC TASK ================= */
+void micTask(void *pvParameters) {
+  const int samples = 256;
+  int32_t raw[samples];
+  uint8_t ulaw[samples];
+  while (true) {
+    if (!micStreamActive || micWsFd < 0) { vTaskDelay(pdMS_TO_TICKS(50)); continue; }
+    size_t bytesRead = 0;
+    i2s_read(I2S_NUM_1, raw, sizeof(raw), &bytesRead, pdMS_TO_TICKS(100));
+    if (bytesRead == 0) continue;
+    int count = bytesRead / 4;
+    int shift = micGainShift;
+    for (int i = 0; i < count; i++) {
+      int32_t s32 = raw[i] >> 8;
+      int32_t boosted = s32 >> shift;
+      int16_t s16 = (int16_t)(std::max(-32768, std::min(32767, (int)boosted)));
+      ulaw[i] = linearToUlaw(s16);
+    }
+    httpd_ws_frame_t ws_pkt;
+    memset(&ws_pkt, 0, sizeof(ws_pkt));
+    ws_pkt.payload = ulaw;
+    ws_pkt.len     = count;
+    ws_pkt.type    = HTTPD_WS_TYPE_BINARY;
+    if (httpd_ws_send_frame_async(httpsServer, micWsFd, &ws_pkt) != ESP_OK) {
+      micStreamActive = false; micWsFd = -1;
+      Serial.println("Helmet mic client disconnected");
+    }
+  }
+}
+
+/* ================= RADAR TASK ================= */
+// LD2450 frame: AA FF 03 00 | t1(6) | t2(6) | t3(6) | 55 CC  = 30 bytes total
+void radarTask(void *pvParameters) {
+  Serial2.begin(RADAR_BAUD, SERIAL_8N1, RADAR_RX_PIN, RADAR_TX_PIN);
+  Serial.println("LD2450 UART started");
+
+  uint8_t frameBuf[30];
+  int framePos = 0;
+  bool inFrame = false;
+
+  // Binary packet sent to browser: 1 byte count + up to 3 * 6 bytes (x,y,speed int16 LE)
+  uint8_t outBuf[1 + 3 * 6];
+
+  while (true) {
+    while (Serial2.available()) {
+      uint8_t b = Serial2.read();
+
+      // Look for frame header: AA FF 03 00
+      if (!inFrame) {
+        // Shift bytes looking for header
+        for (int i = 0; i < 3; i++) frameBuf[i] = frameBuf[i+1];
+        frameBuf[3] = b;
+        if (frameBuf[0] == 0xAA && frameBuf[1] == 0xFF &&
+            frameBuf[2] == 0x03 && frameBuf[3] == 0x00) {
+          inFrame  = true;
+          framePos = 4;
+        }
+      } else {
+        frameBuf[framePos++] = b;
+        if (framePos == 30) {
+          inFrame = false;
+          framePos = 0;
+          // Verify footer
+          if (frameBuf[28] == 0x55 && frameBuf[29] == 0xCC) {
+            int count = 0;
+            bool anyTarget = false;
+            outBuf[0] = 0; // placeholder for count
+
+            for (int t = 0; t < 3; t++) {
+              int base = 4 + t * 6;
+              int16_t x     = (int16_t)(frameBuf[base]     | (frameBuf[base+1] << 8));
+              int16_t y     = (int16_t)(frameBuf[base+2]   | (frameBuf[base+3] << 8));
+              int16_t speed = (int16_t)(frameBuf[base+4]   | (frameBuf[base+5] << 8));
+
+              // LD2450 encodes sign in MSB differently — bit 15 is sign for X
+              // X: bit15=1 means negative (left), clear it to get magnitude
+              // Y: always positive distance
+              if (x & 0x8000) { x = -(x & 0x7FFF); }
+              // Y just needs the magnitude (already positive)
+              y = y & 0x7FFF;
+
+              if (x == 0 && y == 0) continue; // no target in this slot
+
+              // Store in volatile struct for other tasks
+              portENTER_CRITICAL(&radarMux);
+              radarTargets[count].x     = x;
+              radarTargets[count].y     = y;
+              radarTargets[count].speed = speed;
+              radarTargets[count].valid = true;
+              portEXIT_CRITICAL(&radarMux);
+
+              // Pack into output buffer
+              int outBase = 1 + count * 6;
+              outBuf[outBase]     = x & 0xFF;
+              outBuf[outBase + 1] = (x >> 8) & 0xFF;
+              outBuf[outBase + 2] = y & 0xFF;
+              outBuf[outBase + 3] = (y >> 8) & 0xFF;
+              outBuf[outBase + 4] = speed & 0xFF;
+              outBuf[outBase + 5] = (speed >> 8) & 0xFF;
+
+              count++;
+              anyTarget = true;
+            }
+
+            // Clear remaining slots
+            for (int t = count; t < 3; t++) radarTargets[t].valid = false;
+            radarTargetCount = count;
+            outBuf[0] = (uint8_t)count;
+
+            // Trigger "scan" sound if new targets detected (with cooldown)
+            unsigned long now = millis();
+            if (anyTarget && !targetPresent) {
+              if (now - lastTargetSoundMs > TARGET_SOUND_COOLDOWN_MS) {
+                stopAudio = true;
+                pendingSound = "scan";
+                lastTargetSoundMs = now;
+              }
+            }
+            targetPresent = anyTarget;
+
+            // Send to DRADIS WebSocket client
+            if (radarWsActive && radarWsFd >= 0) {
+              httpd_ws_frame_t ws_pkt;
+              memset(&ws_pkt, 0, sizeof(ws_pkt));
+              ws_pkt.payload = outBuf;
+              ws_pkt.len     = 1 + count * 6;
+              ws_pkt.type    = HTTPD_WS_TYPE_BINARY;
+              if (httpd_ws_send_frame_async(httpsServer, radarWsFd, &ws_pkt) != ESP_OK) {
+                radarWsActive = false; radarWsFd = -1;
+                Serial.println("DRADIS client disconnected");
+              }
+            }
+          }
+        }
+      }
+    }
+    vTaskDelay(pdMS_TO_TICKS(5));
+  }
+}
+
+/* ================= LED TASK ================= */
 void ledTask(void *pvParameters) {
   while (true) {
+    if (!ledEnabled) {
+      strip.clear();
+      strip.show();
+      vTaskDelay(pdMS_TO_TICKS(100));
+      continue;
+    }
     for (int pos = 0; pos < LED_COUNT; pos++) {
+      if (!ledEnabled) break;
       drawCylonEye(pos, 255, trailLength, eyeBoostFactor, 1);
       strip.show();
       vTaskDelay(pdMS_TO_TICKS(dynamicDelay(pos)));
     }
     vTaskDelay(pdMS_TO_TICKS(edgePauseDelay));
     for (int pos = LED_COUNT - 2; pos > 0; pos--) {
+      if (!ledEnabled) break;
       drawCylonEye(pos, 255, trailLength, eyeBoostFactor, -1);
       strip.show();
       vTaskDelay(pdMS_TO_TICKS(dynamicDelay(pos)));
@@ -714,14 +1367,11 @@ void setup() {
   maxDelay        = prefs.getInt("maxdelay",   (int)maxDelay);
   stripBrightness = prefs.getInt("brightness", (int)stripBrightness);
   audioVolume     = prefs.getInt("volume",     (int)audioVolume);
+  micGainShift    = prefs.getInt("micgain",    (int)micGainShift);
   strip.setBrightness(stripBrightness);
 
-  if (!LittleFS.begin(true)) {
-    Serial.println("LittleFS mount failed");
-    return;
-  }
+  if (!LittleFS.begin(true)) { Serial.println("LittleFS mount failed"); return; }
   Serial.println("LittleFS mounted");
-
   File root = LittleFS.open("/");
   File file = root.openNextFile();
   while (file) {
@@ -733,16 +1383,12 @@ void setup() {
 
   WiFi.begin(ssid, password);
   Serial.print("Connecting to WiFi");
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
-    Serial.print(".");
-  }
+  while (WiFi.status() != WL_CONNECTED) { delay(500); Serial.print("."); }
   Serial.println();
-  Serial.print("IP address: ");
-  Serial.println(WiFi.localIP());
+  Serial.print("IP: "); Serial.println(WiFi.localIP());
 
   if (MDNS.begin("cylon")) {
-    Serial.println("mDNS started - https://cylon.local");
+    Serial.println("mDNS: https://cylon.local");
     MDNS.addService("https", "tcp", 443);
   }
 
@@ -750,42 +1396,38 @@ void setup() {
 
   xTaskCreatePinnedToCore(ledTask,   "LEDTask",   4096, NULL, 1, NULL, 0);
   xTaskCreatePinnedToCore(audioTask, "AudioTask", 8192, NULL, 1, NULL, 1);
+  xTaskCreatePinnedToCore(micTask,   "MicTask",   8192, NULL, 2, NULL, 1);
+  xTaskCreatePinnedToCore(radarTask, "RadarTask", 4096, NULL, 1, NULL, 0);
 }
 
 /* ================= LOOP ================= */
-void loop() {
-  vTaskDelay(portMAX_DELAY);
-}
+void loop() { vTaskDelay(portMAX_DELAY); }
 
-/* ================= FUNCTIONS ================= */
+/* ================= HELPERS ================= */
 void updateDecayLUT() {
   float lut[16];
-  for (int t = 1; t < 16; t++)
-    lut[t] = powf(trailDecay, t);
+  for (int t = 1; t < 16; t++) lut[t] = powf(trailDecay, t);
   portENTER_CRITICAL(&ledMux);
-  for (int t = 1; t < 16; t++)
-    decayLUT[t] = lut[t];
+  for (int t = 1; t < 16; t++) decayLUT[t] = lut[t];
   portEXIT_CRITICAL(&ledMux);
 }
 
 int dynamicDelay(int eyePos) {
-  float midpoint = (LED_COUNT - 1) / 2.0;
-  float distanceFromCenter = abs(eyePos - midpoint) / midpoint;
-  float delayValue = minDelay + distanceFromCenter * distanceFromCenter * (maxDelay - minDelay);
-  return (int)delayValue;
+  float mid  = (LED_COUNT - 1) / 2.0;
+  float dist = abs(eyePos - mid) / mid;
+  return (int)(minDelay + dist * dist * (maxDelay - minDelay));
 }
 
-void drawCylonEye(int eyePos, uint8_t redValue, int trailLen, float boost,
-                  int direction) {
+void drawCylonEye(int eyePos, uint8_t redValue, int trailLen, float boost, int direction) {
   strip.clear();
   for (int t = 1; t <= trailLen; t++) {
-    int ledIndex = eyePos - t * direction;
-    if (ledIndex >= 0 && ledIndex < LED_COUNT) {
-      uint8_t brightness = (uint8_t)(redValue * decayLUT[t]);
-      strip.setPixelColor(ledIndex, brightness, 0, 0, brightness >> 2); // red + subtle warm glow
+    int idx = eyePos - t * direction;
+    if (idx >= 0 && idx < LED_COUNT) {
+      uint8_t br = (uint8_t)(redValue * decayLUT[t]);
+      strip.setPixelColor(idx, br, 0, 0, 0);
     }
   }
-  int eyeBrightness = redValue * boost;
-  if (eyeBrightness > 255) eyeBrightness = 255;
-  strip.setPixelColor(eyePos, (uint8_t)eyeBrightness, 0, 0, (uint8_t)eyeBrightness); // hot white core
+  int eb = redValue * boost;
+  if (eb > 255) eb = 255;
+  strip.setPixelColor(eyePos, (uint8_t)eb, 0, 0, 0);
 }
