@@ -224,9 +224,6 @@ const char index_html[] PROGMEM = R"rawliteral(
     #dradisCanvas {
       display: block;
       margin: 16px auto 0 auto;
-      border-radius: 50%;
-      border: 2px solid #00ffff;
-      box-shadow: 0 0 20px #00ffff44;
     }
     .dradis-info {
       color: #00ffff;
@@ -359,7 +356,7 @@ const char index_html[] PROGMEM = R"rawliteral(
   <h2>&#9651; DRADIS</h2>
   <button class="btn-radar" id="radarBtn" onclick="toggleRadar()">&#9671; ACTIVATE DRADIS</button>
   <div class="status-cyan" id="radarStatus">DRADIS offline</div>
-  <canvas id="dradisCanvas" width="320" height="320"></canvas>
+  <canvas id="dradisCanvas" width="320" height="175"></canvas>
   <div class="dradis-info" id="dradisInfo">-- NO CONTACTS --</div>
 
   <script>
@@ -629,82 +626,115 @@ const char index_html[] PROGMEM = R"rawliteral(
     }
 
     // ===== DRADIS =====
+    // Sensor sits at bottom-center; FOV is upper 180° semicircle.
+    // Sweep uses math angles: 0=right, π/2=up, π=left (Y negated for canvas).
     const DRADIS_RANGE_MM = 6000;
     const canvas   = document.getElementById('dradisCanvas');
     const ctx      = canvas.getContext('2d');
-    const CX       = canvas.width  / 2;
-    const CY       = canvas.height / 2;
-    const RADIUS   = CX - 10;
+    const CX       = canvas.width  / 2;  // 160
+    const SENSOR_Y = canvas.height - 12; // sensor origin near bottom
+    const RADIUS   = 155;                // 5px margin from sides
 
-    let radarActive    = false;
-    let radarWs        = null;
-    let sweepAngle     = 0;
-    let sweepAnimId    = null;
-    let lastTargets    = [];
-    // Fading blips: array of {x, y, age}
-    let blipTrails     = [];
+    let radarActive = false;
+    let radarWs     = null;
+    // sweepAngle: math angle, π=left → 0=right (decrements each frame)
+    let sweepAngle  = Math.PI / 2;
+    let sweepAnimId = null;
+    let lastTargets = [];
+    let blipTrails  = [];
 
-    function drawDradisIdle() {
-      ctx.clearRect(0, 0, canvas.width, canvas.height);
-      ctx.fillStyle = '#000d0d';
+    // Upper-semicircle clip path (sensor at bottom-center)
+    function dradisClipPath() {
       ctx.beginPath();
-      ctx.arc(CX, CY, RADIUS, 0, Math.PI * 2);
-      ctx.fill();
+      ctx.arc(CX, SENSOR_Y, RADIUS, Math.PI, 0, false); // clockwise = upper arc
+      ctx.closePath(); // straight line closes the flat base
+    }
 
-      // Rings
+    function drawDradisRings() {
       ctx.strokeStyle = '#004433';
       ctx.lineWidth = 1;
       for (let r = 1; r <= 4; r++) {
         ctx.beginPath();
-        ctx.arc(CX, CY, RADIUS * r / 4, 0, Math.PI * 2);
+        ctx.arc(CX, SENSOR_Y, RADIUS * r / 4, Math.PI, 0, false);
         ctx.stroke();
       }
-
-      // Crosshairs
+      // Flat base line
       ctx.beginPath();
-      ctx.moveTo(CX, CY - RADIUS);
-      ctx.lineTo(CX, CY + RADIUS);
-      ctx.moveTo(CX - RADIUS, CY);
-      ctx.lineTo(CX + RADIUS, CY);
+      ctx.moveTo(CX - RADIUS, SENSOR_Y);
+      ctx.lineTo(CX + RADIUS, SENSOR_Y);
       ctx.stroke();
+      // Center vertical axis
+      ctx.strokeStyle = '#003322';
+      ctx.beginPath();
+      ctx.moveTo(CX, SENSOR_Y);
+      ctx.lineTo(CX, SENSOR_Y - RADIUS);
+      ctx.stroke();
+    }
 
-      // Range labels
+    function drawDradisLabels() {
       ctx.fillStyle = '#006644';
       ctx.font = '10px monospace';
       ctx.textAlign = 'center';
       for (let r = 1; r <= 4; r++) {
         const dist = Math.round(DRADIS_RANGE_MM * r / 4 / 1000 * 10) / 10;
-        ctx.fillText(dist + 'm', CX + 4, CY - RADIUS * r / 4 - 3);
+        ctx.fillText(dist + 'm', CX + 4, SENSOR_Y - RADIUS * r / 4 - 3);
       }
+    }
 
+    function drawDradisBorder() {
+      ctx.strokeStyle = '#00ffff44';
+      ctx.lineWidth = 2;
+      dradisClipPath();
+      ctx.stroke();
+    }
+
+    function drawDradisIdle() {
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      dradisClipPath();
+      ctx.fillStyle = '#000d0d';
+      ctx.fill();
+      drawDradisRings();
+      drawDradisLabels();
       ctx.fillStyle = '#004433';
       ctx.font = '11px monospace';
-      ctx.fillText('DRADIS OFFLINE', CX, CY + 5);
+      ctx.textAlign = 'center';
+      ctx.fillText('DRADIS OFFLINE', CX, SENSOR_Y - RADIUS * 0.5);
+      // Sensor dot
+      ctx.fillStyle = '#006644';
+      ctx.beginPath();
+      ctx.arc(CX, SENSOR_Y, 3, 0, Math.PI * 2);
+      ctx.fill();
+      drawDradisBorder();
     }
 
     function drawDradisFrame() {
       ctx.clearRect(0, 0, canvas.width, canvas.height);
 
-      // Background
+      // Background fill
+      dradisClipPath();
       ctx.fillStyle = '#000d0d';
-      ctx.beginPath();
-      ctx.arc(CX, CY, RADIUS, 0, Math.PI * 2);
       ctx.fill();
 
-      // Clip to circle
+      // Clip to semicircle for sweep + blips
       ctx.save();
-      ctx.beginPath();
-      ctx.arc(CX, CY, RADIUS, 0, Math.PI * 2);
+      dradisClipPath();
       ctx.clip();
 
-      // Sweep gradient trail
-      const sweepTrailLength = Math.PI * 0.6;
-      for (let i = 0; i < 60; i++) {
-        const a = sweepAngle - (sweepTrailLength * i / 60);
-        const alpha = (1 - i / 60) * 0.18;
+      // Sweep trail: fan of sector slices behind the sweep line
+      // Trail spans 90° behind current sweep angle (higher math angles = leftward)
+      const trailSpan  = Math.PI * 0.5;
+      const trailSteps = 50;
+      for (let i = 0; i < trailSteps; i++) {
+        const a1    = sweepAngle + trailSpan * i / trailSteps;
+        const a2    = sweepAngle + trailSpan * (i + 1) / trailSteps;
+        const alpha = (1 - i / trailSteps) * 0.22;
         ctx.beginPath();
-        ctx.moveTo(CX, CY);
-        ctx.arc(CX, CY, RADIUS, a, a + sweepTrailLength / 60);
+        ctx.moveTo(CX, SENSOR_Y);
+        for (let j = 0; j <= 3; j++) {
+          const a = a1 + (a2 - a1) * j / 3;
+          ctx.lineTo(CX + Math.cos(a) * RADIUS, SENSOR_Y - Math.sin(a) * RADIUS);
+        }
+        ctx.closePath();
         ctx.fillStyle = `rgba(0,255,180,${alpha})`;
         ctx.fill();
       }
@@ -713,10 +743,10 @@ const char index_html[] PROGMEM = R"rawliteral(
       ctx.strokeStyle = 'rgba(0,255,180,0.9)';
       ctx.lineWidth = 1.5;
       ctx.beginPath();
-      ctx.moveTo(CX, CY);
+      ctx.moveTo(CX, SENSOR_Y);
       ctx.lineTo(
         CX + Math.cos(sweepAngle) * RADIUS,
-        CY + Math.sin(sweepAngle) * RADIUS
+        SENSOR_Y - Math.sin(sweepAngle) * RADIUS
       );
       ctx.stroke();
 
@@ -732,15 +762,11 @@ const char index_html[] PROGMEM = R"rawliteral(
       }
 
       // Live target blips
+      // X: negative=left, positive=right; Y: distance (always positive = upward)
       for (const t of lastTargets) {
         if (!t.valid) continue;
-        // Convert radar coords to canvas:
-        // X: left/right maps to canvas X (positive = right)
-        // Y: distance maps upward from center (sensor at bottom center)
         const px = CX + (t.x / DRADIS_RANGE_MM) * RADIUS;
-        const py = CY - (t.y / DRADIS_RANGE_MM) * RADIUS;
-
-        // Outer glow
+        const py = SENSOR_Y - (t.y / DRADIS_RANGE_MM) * RADIUS;
         const grd = ctx.createRadialGradient(px, py, 0, px, py, 12);
         grd.addColorStop(0, 'rgba(0,255,150,0.9)');
         grd.addColorStop(1, 'rgba(0,255,150,0)');
@@ -748,57 +774,27 @@ const char index_html[] PROGMEM = R"rawliteral(
         ctx.arc(px, py, 12, 0, Math.PI * 2);
         ctx.fillStyle = grd;
         ctx.fill();
-
-        // Core dot
         ctx.beginPath();
         ctx.arc(px, py, 4, 0, Math.PI * 2);
         ctx.fillStyle = '#00ffaa';
         ctx.fill();
-
-        // Add to trail
         blipTrails.push({ cx: px, cy: py, age: 0 });
       }
 
       ctx.restore();
 
-      // Rings (drawn outside clip so they stay crisp)
-      ctx.strokeStyle = '#004433';
-      ctx.lineWidth = 1;
-      for (let r = 1; r <= 4; r++) {
-        ctx.beginPath();
-        ctx.arc(CX, CY, RADIUS * r / 4, 0, Math.PI * 2);
-        ctx.stroke();
-      }
-
-      // Crosshairs
-      ctx.strokeStyle = '#003322';
-      ctx.lineWidth = 1;
+      // Grid, labels, sensor dot and border drawn on top (outside clip)
+      drawDradisRings();
+      drawDradisLabels();
+      ctx.fillStyle = '#00ffff';
       ctx.beginPath();
-      ctx.moveTo(CX, CY - RADIUS);
-      ctx.lineTo(CX, CY + RADIUS);
-      ctx.moveTo(CX - RADIUS, CY);
-      ctx.lineTo(CX + RADIUS, CY);
-      ctx.stroke();
+      ctx.arc(CX, SENSOR_Y, 3, 0, Math.PI * 2);
+      ctx.fill();
+      drawDradisBorder();
 
-      // Range labels
-      ctx.fillStyle = '#006644';
-      ctx.font = '10px monospace';
-      ctx.textAlign = 'center';
-      for (let r = 1; r <= 4; r++) {
-        const dist = Math.round(DRADIS_RANGE_MM * r / 4 / 1000 * 10) / 10;
-        ctx.fillText(dist + 'm', CX + 4, CY - RADIUS * r / 4 - 3);
-      }
-
-      // Border
-      ctx.strokeStyle = '#00ffff44';
-      ctx.lineWidth = 2;
-      ctx.beginPath();
-      ctx.arc(CX, CY, RADIUS, 0, Math.PI * 2);
-      ctx.stroke();
-
-      // Advance sweep
-      sweepAngle += 0.03;
-      if (sweepAngle > Math.PI * 2) sweepAngle -= Math.PI * 2;
+      // Advance sweep: π (left) → 0 (right), then reset
+      sweepAngle -= 0.018;
+      if (sweepAngle < 0) sweepAngle = Math.PI;
 
       sweepAnimId = requestAnimationFrame(drawDradisFrame);
     }
@@ -816,7 +812,7 @@ const char index_html[] PROGMEM = R"rawliteral(
         document.getElementById('radarBtn').classList.add('active');
         document.getElementById('radarBtn').innerHTML = '&#9679; DEACTIVATE DRADIS';
         radarActive = true;
-        sweepAngle = 0;
+        sweepAngle = Math.PI; // start at left edge
         blipTrails = [];
         sweepAnimId = requestAnimationFrame(drawDradisFrame);
       };
