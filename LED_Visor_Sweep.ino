@@ -681,9 +681,10 @@ const char index_html[] PROGMEM = R"rawliteral(
     }
 
     // ===== HELMET MIC LISTEN =====
-    let listenActive = false;
-    let listenWs     = null;
-    let listenCtx    = null;
+    let listenActive   = false;
+    let listenWs       = null;
+    let listenCtx      = null;
+    let listenNextTime = 0;
 
     async function toggleListen() {
       if (!listenActive) { await startListen(); } else { stopListen(); }
@@ -695,6 +696,7 @@ const char index_html[] PROGMEM = R"rawliteral(
       listenWs.binaryType = 'arraybuffer';
 
       listenWs.onopen = () => {
+        listenNextTime = 0;
         document.getElementById('listenStatus').innerText = 'Listening...';
         document.getElementById('listenBtn').classList.add('active');
         document.getElementById('listenBtn').innerHTML = '&#9679; STOP LISTENING';
@@ -722,7 +724,10 @@ const char index_html[] PROGMEM = R"rawliteral(
         const src = listenCtx.createBufferSource();
         src.buffer = buffer;
         src.connect(listenCtx.destination);
-        src.start();
+        const now = listenCtx.currentTime;
+        if (listenNextTime < now + 0.01) listenNextTime = now + 0.06; // resync if behind: 60ms ahead buffer
+        src.start(listenNextTime);
+        listenNextTime += buffer.duration;
       };
     }
 
@@ -1340,7 +1345,7 @@ void audioTask(void *pvParameters) {
 
 /* ================= MIC TASK ================= */
 void micTask(void *pvParameters) {
-  const int samples = 256;
+  const int samples = 512;
   int32_t raw[samples];
   uint8_t ulaw[samples];
   while (true) {
@@ -1451,12 +1456,16 @@ void radarTask(void *pvParameters) {
             radarTargetCount = count;
             outBuf[0] = (uint8_t)count;
 
-            // Check if target is within 1500mm (1.5m)
+            // Check distance with hysteresis: activate at scannerRangeMm,
+            // deactivate at scannerRangeMm + 500mm to prevent boundary jitter
             bool anyClose = false;
             if (count > 0) {
               int32_t dist = (int32_t)sqrtf((float)radarTargets[0].x * radarTargets[0].x +
                                             (float)radarTargets[0].y * radarTargets[0].y);
-              if (dist <= scannerRangeMm) anyClose = true;
+              int32_t threshold = (scannerMode && scannerAutoActivated)
+                                  ? scannerRangeMm + 500   // wider band to deactivate
+                                  : scannerRangeMm;        // normal range to activate
+              if (dist <= threshold) anyClose = true;
             }
 
             // Trigger "scan" sound when close target newly detected (always active)
@@ -1512,6 +1521,13 @@ void ledTask(void *pvParameters) {
   static float smoothPos = LED_COUNT / 2.0f;  // smoothed eye position for scanner mode
   bool wasScanner = false;
 
+  // Rolling average buffer for radar X readings (filters sensor noise)
+  #define RADAR_AVG_SIZE 6
+  float radarBuf[RADAR_AVG_SIZE];
+  int radarBufIdx = 0;
+  bool radarBufFilled = false;
+  for (int i = 0; i < RADAR_AVG_SIZE; i++) radarBuf[i] = LED_COUNT / 2.0f;
+
   while (true) {
     if (!ledEnabled) {
       strip.clear();
@@ -1530,19 +1546,32 @@ void ledTask(void *pvParameters) {
     }
 
     if (scannerMode) {
-      // Read raw target X, map ±1500mm → LED 0–31
-      float targetPos = smoothPos;  // hold last position if no target
+      // Read raw target X, map to LED position
+      float rawPos = smoothPos;  // hold last position if no target
       portENTER_CRITICAL(&radarMux);
       if (radarTargetCount > 0 && radarTargets[0].valid) {
         int x = radarTargets[0].x;
         if (x < -1500) x = -1500;
         if (x >  1500) x =  1500;
-        targetPos = (x + 1500.0f) / 3000.0f * (LED_COUNT - 1);
+        rawPos = (x + 1500.0f) / 3000.0f * (LED_COUNT - 1);
       }
       portEXIT_CRITICAL(&radarMux);
 
-      // Lerp smoothly toward target (25% per 30ms frame ≈ reaches target in ~10 frames)
-      smoothPos += (targetPos - smoothPos) * 0.25f;
+      // Rolling average to filter radar noise
+      radarBuf[radarBufIdx] = rawPos;
+      radarBufIdx = (radarBufIdx + 1) % RADAR_AVG_SIZE;
+      float avgPos = 0;
+      for (int i = 0; i < RADAR_AVG_SIZE; i++) avgPos += radarBuf[i];
+      avgPos /= RADAR_AVG_SIZE;
+
+      // Dead zone: ignore movement smaller than 1 LED to prevent jitter
+      float targetPos = smoothPos;
+      if (fabsf(avgPos - smoothPos) > 1.0f) {
+        targetPos = avgPos;
+      }
+
+      // Lerp smoothly toward target (10% per 30ms frame — slower, more stable)
+      smoothPos += (targetPos - smoothPos) * 0.10f;
       if (smoothPos < 0.0f) smoothPos = 0.0f;
       if (smoothPos > (float)(LED_COUNT - 1)) smoothPos = (float)(LED_COUNT - 1);
       int eyePos = (int)(smoothPos + 0.5f);
@@ -1560,6 +1589,8 @@ void ledTask(void *pvParameters) {
       strip.show();
       wasScanner = false;
       smoothPos = LED_COUNT / 2.0f;
+      for (int i = 0; i < RADAR_AVG_SIZE; i++) radarBuf[i] = LED_COUNT / 2.0f;
+      radarBufIdx = 0;
       vTaskDelay(pdMS_TO_TICKS(50));
     }
 
