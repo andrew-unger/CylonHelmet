@@ -13,7 +13,7 @@
 #define COLOR_ORDER      NEO_GRBW
 
 const char* ssid     = "SnoodleDoodleDoo";
-const char* password = "areyouawizardiot";
+const char* password = "<password>";
 
 #define I2S_BCK   5
 #define I2S_LRCK  6
